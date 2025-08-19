@@ -105,10 +105,10 @@ def generate_signal(df):
         tp = round(harga + 2.0, 2) if arah == "BUY" else round(harga - 2.0, 2)
         sl = round(harga - 1.0, 2) if arah == "BUY" else round(harga + 1.0, 2)
 
-        return arah, score, note, tp, sl
+        return arah, score, note, tp, sl, harga
     except Exception as e:
         print(f"❌ Error generate_signal: {e}")
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
 def format_status(score):
     if score >= 3:
@@ -166,25 +166,25 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
 
     candles = fetch_data(interval="5min")
     df = prepare_df(candles)
-    arah, score, note, tp, sl = generate_signal(df)
+    arah, score, note, tp, sl, harga_asli = generate_signal(df)
 
     if arah is None:
         await context.bot.send_message(chat_id=CHAT_ID, text="❌ Gagal generate sinyal.")
         return
 
-    # Tambahkan 0.3 pada semua harga
-    harga = df["close"].iloc[-1] + 0.3
-    tp += 0.3
-    sl += 0.3
+    # Modifikasi: harga +3, TP/SL ikut
+    harga_display = round(harga_asli + 3, 2)
+    tp_display = round(tp + 3, 2)
+    sl_display = round(sl + 3, 2)
 
     time_now = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
 
     msg = f"""📡 *Sinyal XAU/USD*
 🕒 {time_now} WIB
 📈 Arah: *{arah}*
-💰 Harga: `{harga:.2f}`
-🎯 TP: `{tp:.2f}`
-🛑 SL: `{sl:.2f}`
+💰 Harga: `{harga_display}`
+🎯 TP: `{tp_display}`
+🛑 SL: `{sl_display}`
 📊 Status: {format_status(score)}
 
 🔍 Analisa:
