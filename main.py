@@ -1,23 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Bot sinyal XAU/USD: Support/Resistance (Pivot) + RSI
-Jadwal: setiap 30 menit, aktif Senin 07:00 WIB s/d Jumat 24:00 (Sabtu 00:00) WIB
+Bot sinyal XAU/USD: S/R (Pivot) + RSI — selalu keluarkan BUY/SELL (tanpa WAIT)
+Jadwal: tiap 30 menit, aktif Senin 07:00 WIB s/d Jumat 24:00 (Sabtu 00:00) WIB
 """
 
-# --- Compat: event loop Windows/Python 3.12+ ---
+# --- Compat: event loop untuk Windows/Python 3.12+ ---
 import asyncio
 try:
-    # Windows biasanya butuh SelectorEventLoopPolicy
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 except Exception:
-    # Fallback (mis. Linux/Mac)
     asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
 
 # --- Imports ---
 from flask import Flask
 from threading import Thread
 import requests
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 import pytz
 import pandas as pd
 from ta.momentum import RSIIndicator
@@ -30,18 +28,20 @@ from telegram.ext import (
 )
 
 # ============== KONFIGURASI ==============
-# (Menggunakan yang Anda berikan. Disarankan ganti token setelah tes)
+# (Menggunakan yang Anda berikan. Disarankan revoke & ganti token setelah tes)
 BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
-CHAT_ID = "-1002883903673"           # Kirim ke grup ini
-AUTHORIZED_USER_ID = 1305881282      # Hanya user ini yang boleh /start
+CHAT_ID = "-1002883903673"           # Grup tujuan
+AUTHORIZED_USER_ID = 1305881282      # Hanya user ini boleh /start
 API_KEY = "21a0860958e641cc934bec6277415088"  # TwelveData
 
 SYMBOL = "XAU/USD"
-INTRVAL = "5min"   # timeframe untuk RSI & harga realtime
+INTRVAL = "5min"     # TF intraday untuk RSI & harga realtime
 RSI_WINDOW = 14
-NEAR_SUPPORT_R = 2.5   # ambang kedekatan (USD) ke S1/R1 untuk sinyal
-TP_USD = 3.0           # jarak TP default (USD)
-SL_USD = 1.5           # jarak SL default (USD)
+
+# Parameter strategi (silakan sesuaikan)
+NEAR_BAND_USD = 2.5  # dianggap "dekat" dengan S1/R1 jika jaraknya <= nilai ini
+TP_USD = 3.0         # target profit default (USD)
+SL_USD = 1.5         # stop loss default (USD)
 
 # ============== KEEP ALIVE (opsional server) ==============
 app = Flask(__name__)
@@ -56,26 +56,19 @@ def keep_alive():
 JKT = pytz.timezone("Asia/Jakarta")
 
 def is_bot_working_now(now: datetime | None = None) -> bool:
-    """Aktif Senin 07:00 WIB s/d Jumat 24:00 (Sabtu 00:00) WIB"""
+    """Aktif Sen 07:00 WIB s/d Jumat 24:00 WIB (Sabtu & Minggu off)."""
     if now is None:
         now = datetime.now(JKT)
     wd = now.weekday()  # 0=Mon ... 6=Sun
     t = now.time()
-
-    # Sabtu & Minggu tidak aktif
-    if wd in (5, 6):  # Sat, Sun
+    if wd in (5, 6):           # Sabtu, Minggu
         return False
-
-    # Senin sebelum jam 07:00 tidak aktif
-    if wd == 0 and t < time(7, 0):
+    if wd == 0 and t < time(7, 0):  # Senin sebelum 07:00
         return False
-
-    # Selain itu (Tue-Thu full day, Fri full day sampai 24:00) aktif
     return True
 
 # ============== DATA SOURCE ==============
 def fetch_time_series(symbol: str, interval: str, count: int = 200):
-    """Ambil data time_series dari TwelveData. Return list dict dari yang paling lama ke terbaru."""
     url = (
         f"https://api.twelvedata.com/time_series"
         f"?symbol={symbol}&interval={interval}&apikey={API_KEY}&outputsize={count}&format=JSON"
@@ -86,27 +79,18 @@ def fetch_time_series(symbol: str, interval: str, count: int = 200):
             print(f"❌ HTTP {r.status_code} saat fetch {interval}")
             return None
         values = r.json().get("values", [])
-        # API mengembalikan terbaru di awal; balikkan agar ascending by time
-        return values[::-1]
+        return values[::-1]  # jadikan ascending by time
     except Exception as e:
         print(f"❌ Error fetch_time_series({interval}): {e}")
         return None
 
 def to_df(values):
-    """Konversi list values ke DataFrame float dengan index datetime."""
     try:
         df = pd.DataFrame(values)
         df["datetime"] = pd.to_datetime(df["datetime"])
         df.set_index("datetime", inplace=True)
-        # cast kolom harga jadi float
         for col in ("open", "high", "low", "close"):
             df[col] = df[col].astype(float)
-        if "volume" in df.columns:
-            # tidak selalu ada volume
-            try:
-                df["volume"] = df["volume"].astype(float)
-            except Exception:
-                pass
         return df
     except Exception as e:
         print(f"❌ Error to_df: {e}")
@@ -114,7 +98,7 @@ def to_df(values):
 
 # ============== SUPPORT/RESISTANCE (PIVOT) ==============
 def daily_pivot_levels() -> dict | None:
-    """Hitung Pivot, S1, R1 dari candle harian kemarin."""
+    """Hitung Pivot, S1, R1 dari candle harian kemarin (bar terakhir yang lengkap)."""
     daily_vals = fetch_time_series(SYMBOL, "1day", count=3)
     if not daily_vals:
         return None
@@ -122,18 +106,15 @@ def daily_pivot_levels() -> dict | None:
     if ddf is None or len(ddf) < 2:
         return None
 
-    # Gunakan hari terakhir yang sudah lengkap = bar ke-2 dari belakang
-    yesterday = ddf.iloc[-2]
+    yesterday = ddf.iloc[-2]  # bar harian yang telah closed
     H, L, C = yesterday["high"], yesterday["low"], yesterday["close"]
     pivot = (H + L + C) / 3.0
     s1 = 2 * pivot - H
     r1 = 2 * pivot - L
-
     return {"pivot": pivot, "s1": s1, "r1": r1, "y_high": H, "y_low": L, "y_close": C}
 
 # ============== RSI & SINYAL ==============
 def rsi_from_intraday() -> tuple[pd.DataFrame | None, float | None]:
-    """Ambil data intraday (5m), hitung RSI(14), return (df, rsi_last)."""
     vals = fetch_time_series(SYMBOL, INTRVAL, count=200)
     if not vals:
         return None, None
@@ -142,17 +123,74 @@ def rsi_from_intraday() -> tuple[pd.DataFrame | None, float | None]:
         return None, None
     rsi = RSIIndicator(df["close"], window=RSI_WINDOW).rsi()
     df["rsi"] = rsi
-    rsi_last = float(rsi.iloc[-1])
-    return df, rsi_last
+    return df, float(rsi.iloc[-1])
 
-def generate_signal() -> tuple[str, str, float, float, float, dict] | None:
+def choose_direction(price: float, rsi_last: float, levels: dict) -> tuple[str, str, list[str]]:
     """
-    Gabungan:
-      - Sinyal BUY jika harga dekat SUPPORT (S1) dan RSI < 35
-      - Sinyal SELL jika harga dekat RESISTANCE (R1) dan RSI > 65
-      - Jika tidak memenuhi, WAIT
-    Kembalian: (arah, status_str, harga, tp, sl, extra_info_dict)
+    Paksa pilih BUY/SELL (tanpa WAIT) berbasis skor gabungan:
+    - Kedekatan ke S1/R1
+    - Posisi relatif terhadap Pivot
+    - RSI threshold (bias BUY < 50, bias SELL >= 50)
+    - Ekstra poin bila sangat dekat (<= 1/2 band)
     """
+    notes = []
+    dist_s = abs(price - levels["s1"])
+    dist_r = abs(price - levels["r1"])
+    near_s = dist_s <= NEAR_BAND_USD
+    near_r = dist_r <= NEAR_BAND_USD
+
+    buy_score = 0
+    sell_score = 0
+
+    # Bias RSI
+    if rsi_last < 50: buy_score += 1
+    else: sell_score += 1
+
+    # Agresif RSI extremes
+    if rsi_last <= 35: buy_score += 1
+    if rsi_last >= 65: sell_score += 1
+
+    # Kedekatan ke level
+    if near_s: buy_score += 1
+    if near_r: sell_score += 1
+
+    # Posisi terhadap pivot
+    if price <= levels["pivot"]: buy_score += 1
+    else: sell_score += 1
+
+    # Bonus bila sangat dekat
+    half = NEAR_BAND_USD / 2
+    if dist_s <= half: buy_score += 1
+    if dist_r <= half: sell_score += 1
+
+    if buy_score > sell_score:
+        arah = "BUY"
+    elif sell_score > buy_score:
+        arah = "SELL"
+    else:
+        # Tie-breaker: pilih sisi yang lebih dekat
+        arah = "BUY" if dist_s <= dist_r else "SELL"
+
+    # Catatan analisa
+    if arah == "BUY":
+        if near_s: notes.append(f"✅ Dekat SUPPORT S1 ≈ {levels['s1']:.2f} (jarak {dist_s:.2f})")
+        if rsi_last < 50: notes.append(f"✅ RSI {rsi_last:.1f} < 50 (bias BUY)")
+        if rsi_last <= 35: notes.append("✅ RSI ≤ 35 (cukup oversold)")
+        if price <= levels["pivot"]: notes.append(f"✅ Harga ≤ Pivot ({levels['pivot']:.2f})")
+        if not notes: notes.append("ℹ️ Kondisi netral, memilih BUY (tie-break ke support)")
+    else:
+        if near_r: notes.append(f"✅ Dekat RESISTANCE R1 ≈ {levels['r1']:.2f} (jarak {dist_r:.2f})")
+        if rsi_last >= 50: notes.append(f"✅ RSI {rsi_last:.1f} ≥ 50 (bias SELL)")
+        if rsi_last >= 65: notes.append("✅ RSI ≥ 65 (cukup overbought)")
+        if price > levels["pivot"]: notes.append(f"✅ Harga > Pivot ({levels['pivot']:.2f})")
+        if not notes: notes.append("ℹ️ Kondisi netral, memilih SELL (tie-break ke resistance)")
+
+    # Strength (indikatif)
+    diff = abs(buy_score - sell_score)
+    strength = "🟢 KUAT" if diff >= 2 else "🟡 MODERAT"
+    return arah, strength, notes
+
+def generate_signal() -> tuple[str, str, float, float, float, str, dict] | None:
     levels = daily_pivot_levels()
     if not levels:
         print("❌ Gagal ambil level pivot harian.")
@@ -164,42 +202,17 @@ def generate_signal() -> tuple[str, str, float, float, float, dict] | None:
         return None
 
     price = float(df["close"].iloc[-1])
-
-    # Cek kedekatan ke S1/R1
-    near_support = abs(price - levels["s1"]) <= NEAR_SUPPORT_R
-    near_resist  = abs(price - levels["r1"]) <= NEAR_SUPPORT_R
-
-    arah = "WAIT"
-    note_lines = []
-    strength = "🟡 MODERAT"
-
-    if near_support and rsi_last <= 35:
-        arah = "BUY"
-        strength = "🟢 KUAT" if rsi_last <= 30 else "🟡 MODERAT"
-        note_lines.append(f"✅ Dekat SUPPORT (S1 ≈ {levels['s1']:.2f}) & RSI {rsi_last:.1f} (≤35)")
-    elif near_resist and rsi_last >= 65:
-        arah = "SELL"
-        strength = "🟢 KUAT" if rsi_last >= 70 else "🟡 MODERAT"
-        note_lines.append(f"✅ Dekat RESISTANCE (R1 ≈ {levels['r1']:.2f}) & RSI {rsi_last:.1f} (≥65)")
-    else:
-        # Informasi kenapa WAIT
-        if not (near_support or near_resist):
-            note_lines.append("ℹ️ Harga tidak dekat level S1/R1")
-        note_lines.append(f"ℹ️ RSI saat ini {rsi_last:.1f}")
+    arah, strength, notes = choose_direction(price, rsi_last, levels)
 
     # TP/SL sederhana berbasis arah
     if arah == "BUY":
         tp = round(price + TP_USD, 2)
         sl = round(price - SL_USD, 2)
-    elif arah == "SELL":
+    else:
         tp = round(price - TP_USD, 2)
         sl = round(price + SL_USD, 2)
-    else:
-        tp = sl = 0.0
 
-    status = strength
-    note = "\n".join(note_lines)
-
+    note_text = "\n".join(notes)
     extra = {
         "pivot": levels["pivot"],
         "s1": levels["s1"],
@@ -209,12 +222,11 @@ def generate_signal() -> tuple[str, str, float, float, float, dict] | None:
         "y_close": levels["y_close"],
         "rsi": rsi_last
     }
-
-    return arah, status, price, tp, sl, note, extra
+    return arah, strength, price, tp, sl, note_text, extra
 
 # ============== NEWS FILTER (ForexFactory) ==============
 def check_high_impact_news() -> bool:
-    """True bila ada high impact news ±30 menit dari sekarang (WIB)."""
+    """True jika ada high-impact news ±30 menit dari sekarang (WIB)."""
     try:
         url = "https://www.forexfactory.com/calendar.php?week=this"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -233,7 +245,6 @@ def check_high_impact_news() -> bool:
             if not imp or not tcell:
                 continue
 
-            # tooltip/title biasanya mengandung 'high'
             if "high" not in (imp.get("title", "") + imp.get_text(" ")).lower():
                 continue
 
@@ -241,7 +252,6 @@ def check_high_impact_news() -> bool:
             if not time_txt or time_txt.lower() in ("all day", "tentative"):
                 continue
 
-            # jam di FF default ET/NY – konversi ke WIB
             try:
                 hh, mm = time_txt.split(":")
                 news_time_local = datetime.now(pytz.timezone("America/New_York")).replace(
@@ -266,7 +276,6 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         print(f"⏱️ Di luar jam kerja bot: {now.strftime('%a %H:%M:%S')} WIB")
         return
 
-    # Optional: filter news
     if check_high_impact_news():
         await context.bot.send_message(chat_id=CHAT_ID, text="🚨 High impact news ±30 menit. Sinyal diskip.")
         return
@@ -276,24 +285,19 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=CHAT_ID, text="❌ Gagal menghasilkan sinyal (data tidak cukup).")
         return
 
-    arah, status, price, tp, sl, note, extra = res
+    arah, status, entry, tp, sl, note, extra = res
     tnow = now.strftime("%Y-%m-%d %H:%M:%S")
 
     msg = (
         f"📡 *Sinyal XAU/USD* (S/R + RSI)\n"
         f"🕒 {tnow} WIB\n"
-        f"💰 Harga: `{price:.2f}`\n"
-        f"📊 Status: {status}\n"
         f"📈 Arah: *{arah}*\n"
-    )
-
-    if arah in ("BUY", "SELL"):
-        msg += f"🎯 TP: `{tp:.2f}`\n🛑 SL: `{sl:.2f}`\n"
-
-    msg += (
-        "\n🔍 *Analisa*\n"
-        f"{note}\n"
-        f"\n— Pivot: `{extra['pivot']:.2f}` | S1: `{extra['s1']:.2f}` | R1: `{extra['r1']:.2f}`"
+        f"💰 Entry: `{entry:.2f}`\n"
+        f"🎯 TP: `{tp:.2f}`\n"
+        f"🛑 SL: `{sl:.2f}`\n"
+        f"📊 Status: {status}\n"
+        f"\n🔍 *Analisa*\n{note}"
+        f"\n\n— Pivot: `{extra['pivot']:.2f}` | S1: `{extra['s1']:.2f}` | R1: `{extra['r1']:.2f}`"
         f"\n— H/L/C (kemarin): `{extra['y_high']:.2f}` / `{extra['y_low']:.2f}` / `{extra['y_close']:.2f}`"
         f"\n— RSI(14) 5m: `{extra['rsi']:.1f}`"
     )
@@ -305,7 +309,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != AUTHORIZED_USER_ID:
         await update.message.reply_text("🚫 Anda tidak diizinkan.")
         return
-    await update.message.reply_text("✅ Bot aktif. Sinyal tiap 30 menit (S/R + RSI).")
+    await update.message.reply_text("✅ Bot aktif. Sinyal tiap 30 menit (selalu BUY/SELL).")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("/start — aktifkan bot\n/help — bantuan\n/info — info bot")
@@ -315,7 +319,7 @@ async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Bot sinyal XAU/USD (S/R + RSI)\n"
         "• Interval kirim: 30 menit\n"
         "• Jam kerja: Senin 07:00 WIB s/d Jumat 24:00 WIB\n"
-        "• Skip saat high impact news ±30 menit"
+        "• Saat ada high impact news ±30 menit: sinyal diskip"
     )
 
 async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -323,9 +327,8 @@ async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============== MAIN APP ==============
 def main():
-    # keep_alive hanya kalau running di platform yang perlu ping (opsional)
     try:
-        keep_alive()
+        keep_alive()  # opsional; aman bila lokal juga
     except Exception:
         pass
 
@@ -337,11 +340,10 @@ def main():
     app_.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
 
     jq = app_.job_queue
-
     # Kirim sinyal setiap 30 menit
     jq.run_repeating(send_signal, interval=1800, first=0)
 
-    # Kirim sinyal 1x saat startup jika dalam jam kerja
+    # Kirim 1x saat startup jika dalam jam kerja
     async def startup_once(context: ContextTypes.DEFAULT_TYPE):
         if is_bot_working_now():
             await send_signal(context)
