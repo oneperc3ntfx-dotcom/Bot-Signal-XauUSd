@@ -1,0 +1,8 @@
+requests
+pandas
+beautifulsoup4
+python-telegram-bot[job-queue]==20.3
+ta
+pytz
+nest_asyncio
+flask
