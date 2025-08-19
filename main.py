@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot sinyal XAU/USD: S/R (Pivot) + RSI — selalu keluarkan BUY/SELL (tanpa WAIT)
-Jadwal: tiap 30 menit, aktif Senin 07:00 WIB s/d Jumat 24:00 (Sabtu 00:00) WIB
+Jadwal: tiap 1 menit, aktif Senin 07:00 WIB s/d Jumat 24:00 (Sabtu 00:00) WIB
 """
 
 # --- Compat: event loop untuk Windows/Python 3.12+ ---
@@ -194,158 +194,62 @@ def choose_direction(price: float, rsi_last: float, levels: dict) -> tuple[str, 
 def generate_signal() -> tuple[str, str, float, float, float, str, dict] | None:
     levels = daily_pivot_levels()
     if not levels:
-        print("❌ Gagal ambil level pivot harian.")
+        print("❌ Gagal hitung pivot")
         return None
 
     df, rsi_last = rsi_from_intraday()
     if df is None or rsi_last is None:
-        print("❌ Gagal hitung RSI intraday.")
+        print("❌ Gagal hitung RSI")
         return None
 
-    # Harga realtime (fallback candle close jika gagal)
     price = fetch_realtime_price(SYMBOL)
     if price is None:
-        price = float(df["close"].iloc[-1])
+        print("❌ Gagal fetch price")
+        return None
 
     arah, strength, notes = choose_direction(price, rsi_last, levels)
+    TP = price + TP_USD if arah == "BUY" else price - TP_USD
+    SL = price - SL_USD if arah == "BUY" else price + SL_USD
 
-    if arah == "BUY":
-        tp = round(price + TP_USD, 2)
-        sl = round(price - SL_USD, 2)
-    else:
-        tp = round(price - TP_USD, 2)
-        sl = round(price + SL_USD, 2)
+    return arah, strength, price, TP, SL, "\n".join(notes), levels
 
-    note_text = "\n".join(notes)
-    extra = {
-        "pivot": levels["pivot"],
-        "s1": levels["s1"],
-        "r1": levels["r1"],
-        "y_high": levels["y_high"],
-        "y_low": levels["y_low"],
-        "y_close": levels["y_close"],
-        "rsi": rsi_last
-    }
-    return arah, strength, price, tp, sl, note_text, extra
-
-# ============== NEWS FILTER (ForexFactory) ==============
-def check_high_impact_news() -> bool:
-    try:
-        url = "https://www.forexfactory.com/calendar.php?week=this"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, headers=headers, timeout=12)
-        if resp.status_code != 200:
-            return False
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = soup.select("tr.calendar__row")
-
-        now_jkt = datetime.now(JKT)
-
-        for row in rows:
-            imp = row.select_one("td.calendar__impact")
-            tcell = row.select_one("td.calendar__time")
-            if not imp or not tcell:
-                continue
-            if "high" not in (imp.get("title", "") + imp.get_text(" ")).lower():
-                continue
-            time_txt = tcell.get_text(strip=True)
-            if not time_txt or time_txt.lower() in ("all day", "tentative"):
-                continue
-            try:
-                hh, mm = time_txt.split(":")
-                news_time_local = datetime.now(pytz.timezone("America/New_York")).replace(
-                    hour=int(hh), minute=int(mm), second=0, microsecond=0
-                )
-                news_time_wib = news_time_local.astimezone(JKT)
-            except Exception:
-                continue
-            if abs((news_time_wib - now_jkt).total_seconds()) <= 1800:
-                return True
-        return False
-    except Exception as e:
-        print(f"❌ Error cek news: {e}")
-        return False
-
-# ============== SENDER ==============
-async def send_signal(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now(JKT)
-    if not is_bot_working_now(now):
-        print(f"⏱️ Di luar jam kerja bot: {now.strftime('%a %H:%M:%S')} WIB")
-        return
-
-    if check_high_impact_news():
-        await context.bot.send_message(chat_id=CHAT_ID, text="🚨 High impact news ±30 menit. Sinyal diskip.")
-        return
-
-    res = generate_signal()
-    if not res:
-        await context.bot.send_message(chat_id=CHAT_ID, text="❌ Gagal menghasilkan sinyal (data tidak cukup).")
-        return
-
-    arah, status, entry, tp, sl, note, extra = res
-    tnow = now.strftime("%Y-%m-%d %H:%M:%S")
-
-    msg = (
-        f"📡 *Sinyal XAU/USD* (S/R + RSI)\n"
-        f"🕒 {tnow} WIB\n"
-        f"📈 Arah: *{arah}*\n"
-        f"💰 Entry: `{entry:.2f}`\n"
-        f"🎯 TP: `{tp:.2f}`\n"
-        f"🛑 SL: `{sl:.2f}`\n"
-        f"📊 Status: {status}\n"
-        f"\n🔍 *Analisa*\n{note}"
-        f"\n\n— Pivot: `{extra['pivot']:.2f}` | S1: `{extra['s1']:.2f}` | R1: `{extra['r1']:.2f}`"
-        f"\n— H/L/C (kemarin): `{extra['y_high']:.2f}` / `{extra['y_low']:.2f}` / `{extra['y_close']:.2f}`"
-        f"\n— RSI(14) 5m: `{extra['rsi']:.1f}`"
-    )
-    await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
-
-# ============== COMMANDS ==============
+# ============== TELEGRAM ==============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != AUTHORIZED_USER_ID:
-        await update.message.reply_text("🚫 Anda tidak diizinkan.")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Tidak diizinkan")
         return
-    await update.message.reply_text("✅ Bot aktif. Sinyal tiap 30 menit (selalu BUY/SELL).")
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="Bot dimulai ✅")
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("/start — aktifkan bot\n/help — bantuan\n/info — info bot")
+async def send_signal(context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_working_now():
+        print("🛑 Outside working hours")
+        return
 
-async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Bot sinyal XAU/USD (S/R + RSI)\n"
-        "• Interval kirim: 30 menit\n"
-        "• Jam kerja: Senin 07:00 WIB s/d Jumat 24:00 WIB\n"
-        "• Saat ada high impact news ±30 menit: sinyal diskip"
+    result = generate_signal()
+    if not result:
+        return
+
+    arah, strength, price, TP, SL, notes, levels = result
+    msg = (
+        f"💰 Sinyal {SYMBOL}\n"
+        f"➡️ {arah} [{strength}]\n"
+        f"Price: {price:.2f}\n"
+        f"TP: {TP:.2f} | SL: {SL:.2f}\n"
+        f"{notes}\n"
+        f"Pivot: {levels['pivot']:.2f}, S1: {levels['s1']:.2f}, R1: {levels['r1']:.2f}"
     )
+    await context.bot.send_message(chat_id=CHAT_ID, text=msg)
 
-async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❓ Perintah tidak dikenali.")
+def run_bot():
+    app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start))
+    # Schedule check setiap 1 menit
+    job_queue = app_bot.job_queue
+    job_queue.run_repeating(lambda ctx: asyncio.create_task(send_signal(ctx)), interval=60, first=10)
+    print("🚀 Bot started...")
+    app_bot.run_polling()
 
-# ============== MAIN APP ==============
-def main():
-    try:
-        keep_alive()
-    except Exception:
-        pass
-
-    app_ = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app_.add_handler(CommandHandler("start", start))
-    app_.add_handler(CommandHandler("help", help_cmd))
-    app_.add_handler(CommandHandler("info", info_cmd))
-    app_.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
-
-    jq = app_.job_queue
-    jq.run_repeating(send_signal, interval=1800, first=0)
-
-    async def startup_once(context: ContextTypes.DEFAULT_TYPE):
-        if is_bot_working_now():
-            await send_signal(context)
-    jq.run_once(startup_once, when=0)
-
-    print("🚀 Bot berjalan...")
-    app_.run_polling()
-
+# ============== MAIN ==============
 if __name__ == "__main__":
-    main() 
+    keep_alive()
+    run_bot()
