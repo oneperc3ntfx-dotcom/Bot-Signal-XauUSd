@@ -60,7 +60,7 @@ def is_bot_working_now(now: datetime | None = None) -> bool:
         return False
     if wd == 0 and t < time(7,0):  # Senin sebelum 07:00
         return False
-    if t >= time(0,0) and wd == 4:  # Jumat malam 24:00 = sabtu 00:00
+    if wd == 4 and t >= time(23,59,59):  # Jumat malam 24:00
         return False
     return True
 
@@ -176,7 +176,8 @@ def choose_direction(price: float, rsi_last: float, levels: dict) -> tuple[str, 
     strength = "🟢 KUAT" if diff >= 2 else "🟡 MODERAT"
     return arah, strength, notes
 
-def generate_signal() -> tuple[str, str, float, float, float, str, dict] | None:
+def generate_signal(price: float | None = None) -> tuple[str, str, float, float, float, str, dict] | None:
+    """Jika price diberikan, gunakan sebagai entry price"""
     levels = daily_pivot_levels()
     if not levels:
         print("❌ Gagal hitung pivot")
@@ -185,7 +186,8 @@ def generate_signal() -> tuple[str, str, float, float, float, str, dict] | None:
     if df is None or rsi_last is None:
         print("❌ Gagal hitung RSI")
         return None
-    price = fetch_realtime_price(SYMBOL)
+    if price is None:
+        price = fetch_realtime_price(SYMBOL)
     if price is None:
         print("❌ Gagal fetch price")
         return None
@@ -205,14 +207,18 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_working_now():
         print("🛑 Outside working hours")
         return
-    result = generate_signal()
+    price = fetch_realtime_price(SYMBOL)
+    if price is None:
+        print("❌ Gagal fetch price untuk entry")
+        return
+    result = generate_signal(price=price)
     if not result:
         return
     arah, strength, price, TP, SL, notes, levels = result
     msg = (
         f"💰 Sinyal {SYMBOL}\n"
         f"➡️ {arah} [{strength}]\n"
-        f"Price: {price:.2f}\n"
+        f"Entry Price: {price:.2f}\n"
         f"TP: {TP:.2f} | SL: {SL:.2f}\n"
         f"{notes}\n"
         f"Pivot: {levels['pivot']:.2f}, S1: {levels['s1']:.2f}, R1: {levels['r1']:.2f}"
