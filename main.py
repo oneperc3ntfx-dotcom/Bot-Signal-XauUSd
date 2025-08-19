@@ -172,15 +172,19 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=CHAT_ID, text="❌ Gagal generate sinyal.")
         return
 
-    harga = df["close"].iloc[-1]
+    # Tambahkan 0.3 pada semua harga
+    harga = df["close"].iloc[-1] + 0.3
+    tp += 0.3
+    sl += 0.3
+
     time_now = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
 
     msg = f"""📡 *Sinyal XAU/USD*
 🕒 {time_now} WIB
 📈 Arah: *{arah}*
-💰 Harga: `{harga}`
-🎯 TP: `{tp}`
-🛑 SL: `{sl}`
+💰 Harga: `{harga:.2f}`
+🎯 TP: `{tp:.2f}`
+🛑 SL: `{sl:.2f}`
 📊 Status: {format_status(score)}
 
 🔍 Analisa:
