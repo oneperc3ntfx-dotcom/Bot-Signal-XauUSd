@@ -33,14 +33,14 @@ def keep_alive():
 
 def is_bot_working_now():
     now = datetime.now(pytz.timezone("Asia/Jakarta"))
-    weekday = now.weekday()
+    weekday = now.weekday()  # Senin=0, Minggu=6
     jam = now.time()
     
-    if weekday == 4 and jam >= time(22, 0):  # Jumat setelah 22:00
+    if weekday >= 5:  # Sabtu & Minggu
         return False
-    if weekday in [5, 6]:  # Sabtu dan Minggu
+    if jam < time(7, 0) or jam >= time(24, 0):  # Sebelum jam 7 atau setelah 24:00
         return False
-    return True  # Senin–Kamis dan Jumat sebelum 22:00
+    return True
 
 def fetch_data(symbol="XAU/USD", interval="5min", count=50):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={API_KEY}&outputsize={count}&format=JSON"
@@ -113,51 +113,9 @@ def format_status(score):
         return "🟡 MODERAT"
     return "🔴 LEMAH"
 
-def check_high_impact_news():
-    try:
-        url = "https://www.forexfactory.com/calendar.php?week=this"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return False
-        soup = BeautifulSoup(response.text, "html.parser")
-        rows = soup.select("tr.calendar__row")
-
-        now = datetime.now(pytz.timezone("Asia/Jakarta"))
-
-        for row in rows:
-            impact = row.select_one("td.calendar__impact")
-            time_td = row.select_one("td.calendar__time")
-            if not impact or not time_td:
-                continue
-            if "high" not in impact.get("title", "").lower():
-                continue
-            time_str = time_td.get_text(strip=True)
-            if not time_str or time_str.lower() in ["all day", "tentative"]:
-                continue
-            try:
-                news_time = datetime.strptime(time_str, "%H:%M").time()
-            except:
-                continue
-            ny_tz = pytz.timezone("America/New_York")
-            jakarta_tz = pytz.timezone("Asia/Jakarta")
-            today_ny = datetime.now(ny_tz).replace(hour=news_time.hour, minute=news_time.minute, second=0, microsecond=0)
-            news_jakarta_time = today_ny.astimezone(jakarta_tz)
-            delta = abs((news_jakarta_time - now).total_seconds())
-            if delta <= 1800:
-                return True
-        return False
-    except Exception as e:
-        print(f"❌ Error cek news: {e}")
-        return False
-
 async def send_signal(context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_working_now():
         print("⏱️ Di luar jam kerja bot.")
-        return
-
-    if check_high_impact_news():
-        await context.bot.send_message(chat_id=CHAT_ID, text="🚨 Ada berita berdampak tinggi. Sinyal diskip.")
         return
 
     candles = fetch_data(interval="5min")
@@ -182,7 +140,6 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
 🔍 Analisa:
 {note}
 """
-
     await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
 
 # Commands
@@ -196,7 +153,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("/start\n/help\n/info")
 
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot sinyal XAU/USD\nSenin–Kamis 24 jam\nJumat hingga 22:00 WIB\nAnalisa setiap jam (TF M5)")
+    await update.message.reply_text("Bot sinyal XAU/USD\nSenin–Jumat 07:00–24:00 WIB\nAnalisa setiap 5 menit (TF M5)\nKirim sinyal setiap 15 menit")
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ Perintah tidak dikenali.")
@@ -212,14 +169,38 @@ def main():
 
     job_queue = application.job_queue
 
-    # Kirim sinyal setiap 30 menit (1800 detik)
-    job_queue.run_repeating(send_signal, interval=1800, first=0)
+    # Analisa setiap 5 menit (fetch & prepare data)
+    async def analyze_task(context: ContextTypes.DEFAULT_TYPE):
+        if is_bot_working_now():
+            candles = fetch_data(interval="5min")
+            df = prepare_df(candles)
+            context.chat_data["latest_df"] = df
 
-    # Kirim sinyal langsung setelah startup
-    async def startup(context: ContextTypes.DEFAULT_TYPE):
-        await send_signal(context)
+    job_queue.run_repeating(analyze_task, interval=300, first=0)  # 5 menit
 
-    job_queue.run_once(startup, when=0)
+    # Kirim sinyal setiap 15 menit
+    async def signal_task(context: ContextTypes.DEFAULT_TYPE):
+        if is_bot_working_now() and "latest_df" in context.chat_data:
+            df = context.chat_data["latest_df"]
+            arah, score, note, tp, sl = generate_signal(df)
+            if arah is None:
+                return
+            harga = df["close"].iloc[-1]
+            time_now = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+            msg = f"""📡 *Sinyal XAU/USD*
+🕒 {time_now} WIB
+📈 Arah: *{arah}*
+💰 Harga: `{harga}`
+🎯 TP: `{tp}`
+🛑 SL: `{sl}`
+📊 Status: {format_status(score)}
+
+🔍 Analisa:
+{note}
+"""
+            await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+
+    job_queue.run_repeating(signal_task, interval=900, first=0)  # 15 menit
 
     print("🚀 Bot berjalan...")
     application.run_polling()
