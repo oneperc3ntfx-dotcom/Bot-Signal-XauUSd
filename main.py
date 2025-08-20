@@ -172,10 +172,10 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=CHAT_ID, text="❌ Gagal generate sinyal.")
         return
 
-    # Modifikasi: harga +3, TP/SL ikut
-    harga_display = round(harga_asli + 3, 2)
-    tp_display = round(tp + 3, 2)
-    sl_display = round(sl + 3, 2)
+    # Modifikasi: harga +0.3, TP/SL ikut
+    harga_display = round(harga_asli + 0.3, 2)
+    tp_display = round(tp + 0.3, 2)
+    sl_display = round(sl + 0.3, 2)
 
     time_now = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
 
