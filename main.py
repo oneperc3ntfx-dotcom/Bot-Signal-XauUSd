@@ -16,11 +16,17 @@ from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
 from bs4 import BeautifulSoup
 
+# =========================
 # Konfigurasi
+# =========================
 BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
 CHAT_ID = "-1002883903673"
 AUTHORIZED_USER_ID = 1305881282
 API_KEY = "21a0860958e641cc934bec6277415088"
+
+# OFFSET harga yang ditambahkan ke harga asli, TP, dan SL.
+# Contoh kasus kamu: harga sinyal 3313 sementara harga asli 3320 -> perlu +7.0
+OFFSET = 7.0
 
 app = Flask(__name__)
 
@@ -35,15 +41,12 @@ def is_bot_working_now():
     now = datetime.now(pytz.timezone("Asia/Jakarta"))
     weekday = now.weekday()  # 0=Senin, 6=Minggu
     jam = now.time()
-    
     # Sabtu & Minggu libur
     if weekday in [5, 6]:
         return False
-    
     # Jam kerja: 07:00 - 23:59
     if jam < time(7, 0) or jam > time(23, 59, 59):
         return False
-
     return True
 
 def fetch_data(symbol="XAU/USD", interval="5min", count=50):
@@ -71,9 +74,10 @@ def prepare_df(data):
         return None
 
 def generate_signal(df):
+    # Pastikan selalu return 6 nilai agar tidak error saat unpack
     if df is None or len(df) < 20:
         print("❌ Data tidak cukup")
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     try:
         rsi = RSIIndicator(df["close"], window=14).rsi()
@@ -121,116 +125,4 @@ def check_high_impact_news():
     try:
         url = "https://www.forexfactory.com/calendar.php?week=this"
         headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return False
-        soup = BeautifulSoup(response.text, "html.parser")
-        rows = soup.select("tr.calendar__row")
-
-        now = datetime.now(pytz.timezone("Asia/Jakarta"))
-
-        for row in rows:
-            impact = row.select_one("td.calendar__impact")
-            time_td = row.select_one("td.calendar__time")
-            if not impact or not time_td:
-                continue
-            if "high" not in impact.get("title", "").lower():
-                continue
-            time_str = time_td.get_text(strip=True)
-            if not time_str or time_str.lower() in ["all day", "tentative"]:
-                continue
-            try:
-                news_time = datetime.strptime(time_str, "%H:%M").time()
-            except:
-                continue
-            ny_tz = pytz.timezone("America/New_York")
-            jakarta_tz = pytz.timezone("Asia/Jakarta")
-            today_ny = datetime.now(ny_tz).replace(hour=news_time.hour, minute=news_time.minute, second=0, microsecond=0)
-            news_jakarta_time = today_ny.astimezone(jakarta_tz)
-            delta = abs((news_jakarta_time - now).total_seconds())
-            if delta <= 1800:
-                return True
-        return False
-    except Exception as e:
-        print(f"❌ Error cek news: {e}")
-        return False
-
-async def send_signal(context: ContextTypes.DEFAULT_TYPE):
-    if not is_bot_working_now():
-        print("⏱️ Di luar jam kerja bot.")
-        return
-
-    if check_high_impact_news():
-        await context.bot.send_message(chat_id=CHAT_ID, text="🚨 Ada berita berdampak tinggi. Sinyal diskip.")
-        return
-
-    candles = fetch_data(interval="5min")
-    df = prepare_df(candles)
-    arah, score, note, tp, sl, harga_asli = generate_signal(df)
-
-    if arah is None:
-        await context.bot.send_message(chat_id=CHAT_ID, text="❌ Gagal generate sinyal.")
-        return
-
-    # Modifikasi: harga +0.3, TP/SL ikut
-    harga_display = round(harga_asli + 0.3, 2)
-    tp_display = round(tp + 0.3, 2)
-    sl_display = round(sl + 0.3, 2)
-
-    time_now = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
-
-    msg = f"""📡 *Sinyal XAU/USD*
-🕒 {time_now} WIB
-📈 Arah: *{arah}*
-💰 Harga: `{harga_display}`
-🎯 TP: `{tp_display}`
-🛑 SL: `{sl_display}`
-📊 Status: {format_status(score)}
-
-🔍 Analisa:
-{note}
-"""
-
-    await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
-
-# Commands
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != AUTHORIZED_USER_ID:
-        await update.message.reply_text("🚫 Anda tidak diizinkan.")
-        return
-    await update.message.reply_text("✅ Bot aktif.")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("/start\n/help\n/info")
-
-async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot sinyal XAU/USD\nSenin–Jumat 07:00–23:59 WIB\nAnalisa setiap 15 menit (TF M5)")
-
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❓ Perintah tidak dikenali.")
-
-def main():
-    keep_alive()
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("info", info_command))
-    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-
-    job_queue = application.job_queue
-
-    # Kirim sinyal setiap 15 menit (900 detik)
-    job_queue.run_repeating(send_signal, interval=900, first=0)
-
-    # Kirim sinyal langsung setelah startup
-    async def startup(context: ContextTypes.DEFAULT_TYPE):
-        await send_signal(context)
-
-    job_queue.run_once(startup, when=0)
-
-    print("🚀 Bot berjalan...")
-    application.run_polling()
-
-if __name__ == "__main__":
-    main()
+        response = requests.get(url, headers=hea
