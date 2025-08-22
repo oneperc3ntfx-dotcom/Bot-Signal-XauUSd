@@ -21,7 +21,8 @@ BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
 CHAT_ID = "-1002883903673"
 AUTHORIZED_USER_ID = 1305881282
 API_KEY = "21a0860958e641cc934bec6277415088"
-OFFSET = 0.3   # ubah di sini kalau mau geser harga (misalnya 4 biar 3325 → 3329)
+
+OFFSET = 3  # kalibrasi harga agar sesuai dengan market real
 
 app = Flask(__name__)
 
@@ -169,6 +170,7 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=CHAT_ID, text="❌ Gagal generate sinyal.")
         return
 
+    # Terapkan OFFSET ke harga, TP, dan SL
     harga_asli = df["close"].iloc[-1]
     harga = round(harga_asli + OFFSET, 2)
     tp = round(tp + OFFSET, 2)
