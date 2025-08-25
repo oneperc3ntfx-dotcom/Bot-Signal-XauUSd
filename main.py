@@ -60,29 +60,25 @@ def fetch_data(symbol="XAU/USD", interval="5min", count=50):
         print(f"❌ Error fetch_data: {e}")
         return None
 
-def fetch_realtime_price_twelve(symbol="XAU/USD"):
-    """Ambil harga realtime (1M terakhir) dari Twelve Data"""
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1min&apikey={TWELVE_API_KEY}&outputsize=1&format=JSON"
+def fetch_realtime_price():
+    """Ambil harga realtime dari Metals API, fallback ke Twelve Data"""
     try:
+        url = f"https://metals-api.com/api/latest?access_key={METALS_API_KEY}&base=USD&symbols=XAU"
+        response = requests.get(url, timeout=10).json()
+        rate = response.get("rates", {}).get("XAU")
+        if rate and rate > 0:
+            return round(1 / rate, 2)  # konversi ke USD per XAU
+    except Exception as e:
+        print(f"❌ Error MetalsAPI: {e}")
+
+    # fallback Twelve Data
+    try:
+        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1min&apikey={TWELVE_API_KEY}&outputsize=1&format=JSON"
         response = requests.get(url, timeout=10).json()
         last_candle = response.get("values", [])[0]
         return float(last_candle["close"])
     except Exception as e:
-        print(f"❌ Error fetch_realtime_price_twelve: {e}")
-        return None
-
-def fetch_realtime_price_metals():
-    """Ambil harga realtime dari Metals-API"""
-    url = f"https://metals-api.com/api/latest?access_key={METALS_API_KEY}&base=USD&symbols=XAU"
-    try:
-        response = requests.get(url, timeout=10).json()
-        if "rates" in response and "XAU" in response["rates"]:
-            return float(response["rates"]["XAU"])
-        else:
-            print("❌ Gagal ambil harga dari Metals-API:", response)
-            return None
-    except Exception as e:
-        print(f"❌ Error fetch_realtime_price_metals: {e}")
+        print(f"❌ Error TwelveData fallback: {e}")
         return None
 
 def prepare_df(data):
@@ -192,7 +188,6 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=CHAT_ID, text="🚨 Ada berita berdampak tinggi. Sinyal diskip.")
         return
 
-    # Ambil candle 5M untuk analisa
     candles = fetch_data(interval="5min")
     df = prepare_df(candles)
     arah, score, note = generate_signal(df)
@@ -201,14 +196,10 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=CHAT_ID, text="❌ Gagal generate sinyal.")
         return
 
-    # Ambil harga realtime
-    harga_live = fetch_realtime_price_metals()
+    harga_live = fetch_realtime_price()
     if harga_live is None:
-        harga_live = fetch_realtime_price_twelve()
-    if harga_live is None:
-        harga_live = df["close"].iloc[-1]
+        harga_live = df["close"].iloc[-1]  # fallback
 
-    # Hitung TP & SL
     if arah == "BUY":
         tp = round(harga_live + 2.0, 2)
         sl = round(harga_live - 1.0, 2)
@@ -244,7 +235,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("/start\n/help\n/info")
 
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot sinyal XAU/USD\nSenin–Kamis 24 jam\nJumat hingga 22:00 WIB\nAnalisa setiap jam (TF M5, harga realtime Metals-API + Twelve Data)")
+    await update.message.reply_text("Bot sinyal XAU/USD\nSenin–Kamis 24 jam\nJumat hingga 22:00 WIB\nAnalisa setiap jam (TF M5, harga realtime MetalsAPI+TwelveData)")
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ Perintah tidak dikenali.")
@@ -262,10 +253,8 @@ def main():
 
     job_queue = application.job_queue
 
-    # Sinyal tiap 1 jam
     job_queue.run_repeating(send_signal, interval=3600, first=0)
 
-    # Sinyal pertama setelah startup
     async def startup(context: ContextTypes.DEFAULT_TYPE):
         await send_signal(context)
 
