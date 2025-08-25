@@ -20,8 +20,8 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
 CHAT_ID = "-1002883903673"
 AUTHORIZED_USER_ID = 1305881282
-API_KEY_TWELVE = "21a0860958e641cc934bec6277415088"
-API_KEY_METALS = "2fzz3e9hw1rachdt6jwwo4furz1arvngsm879pg5bj9ucoe2xjjbv4l4gn72"
+TWELVE_API_KEY = "21a0860958e641cc934bec6277415088"
+METALS_API_KEY = "2fzz3e9hw1rachdt6jwwo4furz1arvngsm879pg5bj9ucoe2xjjbv4l4gn72"
 # ============================================
 
 app = Flask(__name__)
@@ -48,7 +48,7 @@ def is_bot_working_now():
 
 # ================== DATA FETCHER ==================
 def fetch_data(symbol="XAU/USD", interval="5min", count=50):
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={API_KEY_TWELVE}&outputsize={count}&format=JSON"
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={TWELVE_API_KEY}&outputsize={count}&format=JSON"
     try:
         response = requests.get(url, timeout=10)
         if response.status_code != 200:
@@ -60,15 +60,29 @@ def fetch_data(symbol="XAU/USD", interval="5min", count=50):
         print(f"❌ Error fetch_data: {e}")
         return None
 
-def fetch_realtime_price():
-    """Ambil harga realtime dari Metals-API"""
-    url = f"https://metals-api.com/api/latest?access_key={API_KEY_METALS}&base=USD&symbols=XAU"
+def fetch_realtime_price_twelve(symbol="XAU/USD"):
+    """Ambil harga realtime (1M terakhir) dari Twelve Data"""
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1min&apikey={TWELVE_API_KEY}&outputsize=1&format=JSON"
     try:
         response = requests.get(url, timeout=10).json()
-        price = response["rates"]["XAU"]
-        return round(float(price), 2)
+        last_candle = response.get("values", [])[0]
+        return float(last_candle["close"])
     except Exception as e:
-        print(f"❌ Error fetch_realtime_price: {e}")
+        print(f"❌ Error fetch_realtime_price_twelve: {e}")
+        return None
+
+def fetch_realtime_price_metals():
+    """Ambil harga realtime dari Metals-API"""
+    url = f"https://metals-api.com/api/latest?access_key={METALS_API_KEY}&base=USD&symbols=XAU"
+    try:
+        response = requests.get(url, timeout=10).json()
+        if "rates" in response and "XAU" in response["rates"]:
+            return float(response["rates"]["XAU"])
+        else:
+            print("❌ Gagal ambil harga dari Metals-API:", response)
+            return None
+    except Exception as e:
+        print(f"❌ Error fetch_realtime_price_metals: {e}")
         return None
 
 def prepare_df(data):
@@ -178,6 +192,7 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=CHAT_ID, text="🚨 Ada berita berdampak tinggi. Sinyal diskip.")
         return
 
+    # Ambil candle 5M untuk analisa
     candles = fetch_data(interval="5min")
     df = prepare_df(candles)
     arah, score, note = generate_signal(df)
@@ -186,11 +201,14 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=CHAT_ID, text="❌ Gagal generate sinyal.")
         return
 
-    harga_live = fetch_realtime_price()
+    # Ambil harga realtime
+    harga_live = fetch_realtime_price_metals()
+    if harga_live is None:
+        harga_live = fetch_realtime_price_twelve()
     if harga_live is None:
         harga_live = df["close"].iloc[-1]
 
-    # TP & SL
+    # Hitung TP & SL
     if arah == "BUY":
         tp = round(harga_live + 2.0, 2)
         sl = round(harga_live - 1.0, 2)
@@ -226,7 +244,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("/start\n/help\n/info")
 
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot sinyal XAU/USD\nSenin–Kamis 24 jam\nJumat hingga 22:00 WIB\nAnalisa setiap jam (TF M5, harga realtime Metals-API)")
+    await update.message.reply_text("Bot sinyal XAU/USD\nSenin–Kamis 24 jam\nJumat hingga 22:00 WIB\nAnalisa setiap jam (TF M5, harga realtime Metals-API + Twelve Data)")
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ Perintah tidak dikenali.")
@@ -243,8 +261,11 @@ def main():
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     job_queue = application.job_queue
+
+    # Sinyal tiap 1 jam
     job_queue.run_repeating(send_signal, interval=3600, first=0)
 
+    # Sinyal pertama setelah startup
     async def startup(context: ContextTypes.DEFAULT_TYPE):
         await send_signal(context)
 
