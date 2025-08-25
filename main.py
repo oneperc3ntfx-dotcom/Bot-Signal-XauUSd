@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
 CHAT_ID = "-1002883903673"
 AUTHORIZED_USER_ID = 1305881282
-API_KEY_TWELVE = "21a0860958e641cc934bec6277415088"
+API_KEY_TWELVE = "af23649e02da42aab3e78cf343513325"
 API_KEY_METALS = "2fzz3e9hw1rachdt6jwwo4furz1arvngsm879pg5bj9ucoe2xjjbv4l4gn72"
 
 # Metals-API usage guard: agar < 200 call/hari, hanya hit saat kirim sinyal
