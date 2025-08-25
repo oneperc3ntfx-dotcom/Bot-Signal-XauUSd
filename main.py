@@ -16,13 +16,12 @@ from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
 from bs4 import BeautifulSoup
 
-# Konfigurasi
+# ================== CONFIG ==================
 BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
 CHAT_ID = "-1002883903673"
 AUTHORIZED_USER_ID = 1305881282
 API_KEY = "21a0860958e641cc934bec6277415088"
-
-OFFSET = 3  # kalibrasi harga agar sesuai dengan market real
+# ============================================
 
 app = Flask(__name__)
 
@@ -33,6 +32,7 @@ def home():
 def keep_alive():
     Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
 
+# ================== MARKET TIME ==================
 def is_bot_working_now():
     now = datetime.now(pytz.timezone("Asia/Jakarta"))
     weekday = now.weekday()
@@ -42,8 +42,10 @@ def is_bot_working_now():
         return False
     if weekday in [5, 6]:  # Sabtu dan Minggu
         return False
-    return True  # Senin–Kamis dan Jumat sebelum 22:00
+    return True
+# =================================================
 
+# ================== DATA FETCHER ==================
 def fetch_data(symbol="XAU/USD", interval="5min", count=50):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={API_KEY}&outputsize={count}&format=JSON"
     try:
@@ -52,9 +54,20 @@ def fetch_data(symbol="XAU/USD", interval="5min", count=50):
             print(f"❌ Gagal ambil data: HTTP {response.status_code}")
             return None
         data = response.json().get("values", [])
-        return data[::-1]
+        return data[::-1]  # ascending
     except Exception as e:
         print(f"❌ Error fetch_data: {e}")
+        return None
+
+def fetch_realtime_price(symbol="XAU/USD"):
+    """Ambil harga realtime (1M terakhir)"""
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1min&apikey={API_KEY}&outputsize=1&format=JSON"
+    try:
+        response = requests.get(url, timeout=10).json()
+        last_candle = response.get("values", [])[0]
+        return float(last_candle["close"])
+    except Exception as e:
+        print(f"❌ Error fetch_realtime_price: {e}")
         return None
 
 def prepare_df(data):
@@ -67,11 +80,13 @@ def prepare_df(data):
     except Exception as e:
         print(f"❌ Error prepare_df: {e}")
         return None
+# =================================================
 
+# ================== STRATEGY ==================
 def generate_signal(df):
     if df is None or len(df) < 20:
         print("❌ Data tidak cukup")
-        return None, None, None, None, None
+        return None, None, None
 
     try:
         rsi = RSIIndicator(df["close"], window=14).rsi()
@@ -99,14 +114,10 @@ def generate_signal(df):
 
         arah = "BUY" if last["close"] > prev["close"] else "SELL"
 
-        harga = last["close"]
-        tp = round(harga + 2.0, 2) if arah == "BUY" else round(harga - 2.0, 2)
-        sl = round(harga - 1.0, 2) if arah == "BUY" else round(harga + 1.0, 2)
-
-        return arah, score, note, tp, sl
+        return arah, score, note
     except Exception as e:
         print(f"❌ Error generate_signal: {e}")
-        return None, None, None, None, None
+        return None, None, None
 
 def format_status(score):
     if score >= 3:
@@ -114,7 +125,9 @@ def format_status(score):
     elif score == 2:
         return "🟡 MODERAT"
     return "🔴 LEMAH"
+# =================================================
 
+# ================== NEWS FILTER ==================
 def check_high_impact_news():
     try:
         url = "https://www.forexfactory.com/calendar.php?week=this"
@@ -146,13 +159,15 @@ def check_high_impact_news():
             today_ny = datetime.now(ny_tz).replace(hour=news_time.hour, minute=news_time.minute, second=0, microsecond=0)
             news_jakarta_time = today_ny.astimezone(jakarta_tz)
             delta = abs((news_jakarta_time - now).total_seconds())
-            if delta <= 1800:
+            if delta <= 1800:  # 30 menit
                 return True
         return False
     except Exception as e:
         print(f"❌ Error cek news: {e}")
         return False
+# =================================================
 
+# ================== SIGNAL ENGINE ==================
 async def send_signal(context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_working_now():
         print("⏱️ Di luar jam kerja bot.")
@@ -162,26 +177,34 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=CHAT_ID, text="🚨 Ada berita berdampak tinggi. Sinyal diskip.")
         return
 
+    # Ambil candle 5M untuk analisa
     candles = fetch_data(interval="5min")
     df = prepare_df(candles)
-    arah, score, note, tp, sl = generate_signal(df)
+    arah, score, note = generate_signal(df)
 
     if arah is None:
         await context.bot.send_message(chat_id=CHAT_ID, text="❌ Gagal generate sinyal.")
         return
 
-    # Terapkan OFFSET ke harga, TP, dan SL
-    harga_asli = df["close"].iloc[-1]
-    harga = round(harga_asli + OFFSET, 2)
-    tp = round(tp + OFFSET, 2)
-    sl = round(sl + OFFSET, 2)
+    # Ambil harga realtime 1M
+    harga_live = fetch_realtime_price()
+    if harga_live is None:
+        harga_live = df["close"].iloc[-1]  # fallback
+
+    # Hitung TP & SL
+    if arah == "BUY":
+        tp = round(harga_live + 2.0, 2)
+        sl = round(harga_live - 1.0, 2)
+    else:
+        tp = round(harga_live - 2.0, 2)
+        sl = round(harga_live + 1.0, 2)
 
     time_now = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
 
     msg = f"""📡 *Sinyal XAU/USD*
 🕒 {time_now} WIB
 📈 Arah: *{arah}*
-💰 Harga: `{harga}`
+💰 Harga: `{harga_live}`
 🎯 TP: `{tp}`
 🛑 SL: `{sl}`
 📊 Status: {format_status(score)}
@@ -191,8 +214,9 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
 """
 
     await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+# =================================================
 
-# Commands
+# ================== COMMAND HANDLER ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != AUTHORIZED_USER_ID:
         await update.message.reply_text("🚫 Anda tidak diizinkan.")
@@ -203,11 +227,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("/start\n/help\n/info")
 
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot sinyal XAU/USD\nSenin–Kamis 24 jam\nJumat hingga 22:00 WIB\nAnalisa setiap jam (TF M5)")
+    await update.message.reply_text("Bot sinyal XAU/USD\nSenin–Kamis 24 jam\nJumat hingga 22:00 WIB\nAnalisa setiap jam (TF M5, harga realtime M1)")
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ Perintah tidak dikenali.")
+# =================================================
 
+# ================== MAIN ==================
 def main():
     keep_alive()
     application = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -219,10 +245,10 @@ def main():
 
     job_queue = application.job_queue
 
-    # Kirim sinyal setiap 1 jam (3600 detik)
+    # Sinyal tiap 1 jam
     job_queue.run_repeating(send_signal, interval=3600, first=0)
 
-    # Kirim sinyal langsung setelah startup
+    # Sinyal pertama setelah startup
     async def startup(context: ContextTypes.DEFAULT_TYPE):
         await send_signal(context)
 
