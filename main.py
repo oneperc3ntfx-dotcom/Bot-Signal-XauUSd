@@ -40,13 +40,22 @@ def keep_alive():
 # ================== MARKET TIME ==================
 def is_bot_working_now():
     now = datetime.now(pytz.timezone("Asia/Jakarta"))
-    weekday = now.weekday()
+    weekday = now.weekday()  # 0=Senin, 6=Minggu
     jam = now.time()
-    
-    if weekday == 4 and jam >= time(22, 0):  # Jumat setelah 22:00 WIB
+
+    # Sabtu & Minggu libur
+    if weekday in [5, 6]:
         return False
-    if weekday in [5, 6]:  # Sabtu dan Minggu (pasar tutup)
+
+    # Senin: mulai jam 06:00 WIB
+    if weekday == 0 and jam < time(6, 0):
         return False
+
+    # Jumat: hanya sampai 22:00 WIB
+    if weekday == 4 and jam >= time(22, 0):
+        return False
+
+    # Selain kondisi di atas -> bot aktif
     return True
 # =================================================
 
