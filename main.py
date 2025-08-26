@@ -16,7 +16,7 @@ from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
 
 # ================== CONFIG ==================
-BOT_TOKEN = "TOKEN_TELEGRAM_ANDA"
+BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
 CHAT_ID = "-1002883903673"
 AUTHORIZED_USER_ID = 1305881282
 
