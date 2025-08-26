@@ -423,7 +423,7 @@ def main():
 
     # Sinyal reguler: tiap 5 menit; Strong scan: tiap 60 detik
     app.job_queue.run_repeating(send_signal, interval=1800, first=10)  # setiap 30 menit
-    app.job_queue.run_repeating(monitor_strong_signal, interval=60, first=20)  # strong setup
+    bot_app.job_queue.run_repeating(monitor_strong_signal, interval=60, first=20)
 
     print("🤖 Bot berjalan...")
     app.run_polling()
