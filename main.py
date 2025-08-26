@@ -11,7 +11,7 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 )
 import pandas as pd
-from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
 
@@ -97,8 +97,8 @@ def prepare_df(data):
     return df
 
 # ---- Analisa Teknis Lengkap ----
-def analyze(df):
-    if df is None or len(df) < 20: return []
+def analyze(df, price):
+    if df is None or len(df) < 20: return [], None, None, None, None, None, None
 
     rsi = RSIIndicator(df["close"], window=14).rsi().iloc[-1]
     ema20 = EMAIndicator(df["close"], window=20).ema_indicator().iloc[-1]
@@ -126,19 +126,42 @@ def analyze(df):
     analysis.append(f"Support: {support:.2f} | Resistance: {resistance:.2f}")
     analysis.append(f"Fibo 61.8%: {fib_618:.2f} | 50%: {fib_500:.2f} | 38.2%: {fib_382:.2f}")
 
-    return analysis
+    # Tentukan arah signal
+    direction = "BUY" if df["close"].iloc[-1] > ema20 and macd_val > macd_sig else "SELL"
+
+    # TP/SL dari SNR
+    if direction == "BUY":
+        tp_snr = resistance
+        sl_snr = max(support, price - atr)
+    else:
+        tp_snr = support
+        sl_snr = min(resistance, price + atr)
+
+    # TP/SL dari Risk Reward (1:2) pakai ATR
+    if direction == "BUY":
+        sl_rr = price - atr
+        tp_rr = price + (atr * 2)
+    else:
+        sl_rr = price + atr
+        tp_rr = price - (atr * 2)
+
+    return analysis, tp_snr, sl_snr, tp_rr, sl_rr, direction, atr
 
 # ================== MESSAGE ==================
-def format_signal(df, price, analysis):
+def format_signal(price, analysis, tp_snr, sl_snr, tp_rr, sl_rr, direction):
     analysis_text = "\n- ".join(analysis)
-    direction = "⬆️ BUY" if "Bullish" in " ".join(analysis) else "⬇️ SELL"
+    arrow = "⬆️" if direction == "BUY" else "⬇️"
 
     now_wib = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
     return (
         f"📊 **Gold Trading Signal** 📊\n\n"
-        f"Signal: {direction}\n"
+        f"Signal: {arrow} {direction}\n"
         f"Price: `{price}`\n\n"
         f"Analysis:\n- {analysis_text}\n\n"
+        f"🎯 TP (SNR): {tp_snr:.2f}\n"
+        f"🛑 SL (SNR): {sl_snr:.2f}\n\n"
+        f"🎯 TP (RR 1:2): {tp_rr:.2f}\n"
+        f"🛑 SL (RR 1:2): {sl_rr:.2f}\n\n"
         f"🕒 {now_wib} WIB"
     )
 
@@ -148,12 +171,13 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
 
     candles = fetch_twelvedata_series(interval="5min")
     df = prepare_df(candles)
-    analysis = analyze(df)
-    if not analysis: return
+    if df is None: return
 
     harga_live = fetch_realtime_price_metals_fast() or fetch_realtime_price_twelve() or df["close"].iloc[-1]
-    msg = format_signal(df, harga_live, analysis)
+    analysis, tp_snr, sl_snr, tp_rr, sl_rr, direction, _ = analyze(df, harga_live)
+    if not analysis: return
 
+    msg = format_signal(harga_live, analysis, tp_snr, sl_snr, tp_rr, sl_rr, direction)
     await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
 
 # ================== HANDLERS ==================
