@@ -20,10 +20,23 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
 CHAT_ID = "-1002883903673"
 AUTHORIZED_USER_ID = 1305881282
-API_KEY_TWELVE = "af23649e02da42aab3e78cf343513325"
-API_KEY_METALS = "2fzz3e9hw1rachdt6jwwo4furz1arvngsm879pg5bj9ucoe2xjjbv4l4gn72"
 
-# Metals-API usage guard: agar < 200 call/hari, hanya hit saat kirim sinyal
+# Multiple API Keys TwelveData
+API_KEYS_TWELVE = [
+    "94a7d766d73f4db4a7ddf877473711c7",
+    "af23649e02da42aab3e78cf343513325",
+    "af23649e02da42aab3e78cf343513325"
+]
+
+_current_key_index = 0
+
+def get_active_api_key():
+    global _current_key_index
+    key = API_KEYS_TWELVE[_current_key_index]
+    _current_key_index = (_current_key_index + 1) % len(API_KEYS_TWELVE)  # round-robin
+    return key
+
+API_KEY_METALS = "2fzz3e9hw1rachdt6jwwo4furz1arvngsm879pg5bj9ucoe2xjjbv4l4gn72"
 
 # ================== FLASK KEEP-ALIVE ==================
 app = Flask(__name__)
@@ -48,17 +61,23 @@ def is_bot_working_now():
 
 # ================== DATA FETCHER ==================
 def fetch_twelvedata_series(symbol="XAU/USD", interval="5min", count=120):
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={API_KEY_TWELVE}&outputsize={count}&format=JSON"
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code != 200:
-            print(f"❌ Gagal ambil data TwelveData: HTTP {response.status_code}")
-            return None
-        data = response.json().get("values", [])
-        return data[::-1]  # ascending (lama -> baru)
-    except Exception as e:
-        print(f"❌ Error fetch_twelvedata_series: {e}")
-        return None
+    for _ in range(len(API_KEYS_TWELVE)):
+        api_key = get_active_api_key()
+        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={api_key}&outputsize={count}&format=JSON"
+        try:
+            response = requests.get(url, timeout=10)
+            if response.status_code != 200:
+                print(f"❌ Gagal ambil data TwelveData: HTTP {response.status_code}")
+                continue
+            data = response.json()
+            if "status" in data and data["status"] == "error":
+                print(f"❌ Error TwelveData: {data.get('message')}")
+                continue
+            return data.get("values", [])[::-1]
+        except Exception as e:
+            print(f"❌ Error fetch_twelvedata_series: {e}")
+            continue
+    return None
 
 def fetch_realtime_price_metals():
     try:
@@ -74,14 +93,20 @@ def fetch_realtime_price_metals():
         return None
 
 def fetch_realtime_price_twelve():
-    try:
-        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1min&apikey={API_KEY_TWELVE}&outputsize=1&format=JSON"
-        r = requests.get(url, timeout=10).json()
-        last = r.get("values", [])[0]
-        return float(last["close"]) if last else None
-    except Exception as e:
-        print(f"❌ Error fetch_realtime_price_twelve: {e}")
-        return None
+    for _ in range(len(API_KEYS_TWELVE)):
+        api_key = get_active_api_key()
+        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1min&apikey={api_key}&outputsize=1&format=JSON"
+        try:
+            r = requests.get(url, timeout=10).json()
+            if "status" in r and r["status"] == "error":
+                print(f"❌ Error TwelveData: {r.get('message')}")
+                continue
+            last = r.get("values", [])[0]
+            return float(last["close"]) if last else None
+        except Exception as e:
+            print(f"❌ Error fetch_realtime_price_twelve: {e}")
+            continue
+    return None
 
 def prepare_df(data):
     try:
@@ -133,17 +158,12 @@ def detect_candles(prev, last):
     upper_wick = last["high"] - max(last["close"], last["open"])
     lower_wick = min(last["close"], last["open"]) - last["low"]
 
-    # Doji
     if range_ > 0 and body <= 0.1 * range_:
         notes.append("⚠️ Doji terdeteksi")
-
-    # Hammer / Shooting Star
     if body > 0 and lower_wick >= 2 * body and upper_wick <= body:
         notes.append("🔨 Hammer (bullish potensi reversal)")
     if body > 0 and upper_wick >= 2 * body and lower_wick <= body:
         notes.append("🌠 Shooting Star / Inverted Hammer (bearish potensi reversal)")
-
-    # Engulfing
     if last["close"] > last["open"] and prev["close"] < prev["open"] and last["close"] > prev["open"] and last["open"] < prev["close"]:
         notes.append("✅ Bullish Engulfing")
     if last["close"] < last["open"] and prev["close"] > prev["open"] and last["close"] < prev["open"] and last["open"] > prev["close"]:
@@ -175,17 +195,11 @@ def extra_analysis(df):
         last, prev = temp.iloc[-1], temp.iloc[-2]
 
         analysis = []
-
-        # Bollinger Bands
         if last["close"] >= last["bb_high"]:
             analysis.append("⚠️ Sentuh upper BB (potensi jenuh beli)")
         elif last["close"] <= last["bb_low"]:
             analysis.append("⚠️ Sentuh lower BB (potensi jenuh jual)")
-
-        # MACD
         analysis.append("📈 MACD bullish" if last["macd"] > last["macdsig"] else "📉 MACD bearish")
-
-        # Stochastic
         if last["k"] > 80:
             analysis.append("⚠️ Stochastic overbought")
         elif last["k"] < 20:
@@ -194,14 +208,8 @@ def extra_analysis(df):
             analysis.append("✅ Stochastic bullish crossover")
         else:
             analysis.append("❌ Stochastic bearish crossover")
-
-        # ATR
         analysis.append(f"📊 ATR: {round(last['atr'], 2)}")
-
-        # Candle patterns
         analysis += detect_candles(prev, last)
-
-        # Tren EMA
         if last["ema9"] > last["ema20"]:
             analysis.append("🟢 Tren pendek bullish (EMA9>EMA20)")
         elif last["ema9"] < last["ema20"]:
@@ -220,11 +228,9 @@ def check_high_impact_news():
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code != 200:
             return False
-
         soup = BeautifulSoup(response.text, "html.parser")
         rows = soup.select("tr.calendar__row")
         now = datetime.now(pytz.timezone("Asia/Jakarta"))
-
         for row in rows:
             impact = row.select_one("td.calendar__impact")
             time_td = row.select_one("td.calendar__time")
@@ -232,32 +238,28 @@ def check_high_impact_news():
                 continue
             if "high" not in impact.get("title", "").lower():
                 continue
-
             time_str = time_td.get_text(strip=True)
             if not time_str or time_str.lower() in ["all day", "tentative"]:
                 continue
-
             try:
                 news_time = datetime.strptime(time_str, "%H:%M").time()
             except:
                 continue
-
             ny_tz = pytz.timezone("America/New_York")
             jakarta_tz = pytz.timezone("Asia/Jakarta")
             today_ny = datetime.now(ny_tz).replace(hour=news_time.hour, minute=news_time.minute, second=0, microsecond=0)
             news_jakarta_time = today_ny.astimezone(jakarta_tz)
             delta = abs((news_jakarta_time - now).total_seconds())
-            if delta <= 1800:  # 30 menit
+            if delta <= 1800:
                 return True
-
         return False
     except Exception as e:
         print(f"❌ Error cek news: {e}")
         return False
 
-# ================== SIGNAL ENGINE & STRONG SETUP ==================
+# ================== SIGNAL ENGINE ==================
 _last_strong_sent_at = None
-_strong_cooldown_min = 10  # jeda antar strong signal (menit)
+_strong_cooldown_min = 10
 
 async def send_signal(context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_working_now():
@@ -266,20 +268,17 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
     if check_high_impact_news():
         await context.bot.send_message(chat_id=CHAT_ID, text="🚨 Ada berita berdampak tinggi. Sinyal diskip.")
         return
-
     candles = fetch_twelvedata_series(interval="5min")
     df = prepare_df(candles)
     arah, score, note = generate_signal(df)
     if arah is None:
         await context.bot.send_message(chat_id=CHAT_ID, text="❌ Gagal generate sinyal.")
         return
-
     harga_live = fetch_realtime_price_metals() or fetch_realtime_price_twelve() or df["close"].iloc[-1]
     tp = round(harga_live + 2.0, 2) if arah == "BUY" else round(harga_live - 2.0, 2)
     sl = round(harga_live - 1.0, 2) if arah == "BUY" else round(harga_live + 1.0, 2)
     time_now = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
     tambahan = extra_analysis(df)
-
     msg = f"""📡 *Sinyal XAU/USD* 🕒 {time_now} WIB
 📈 Arah: *{arah}*
 💰 Harga: {harga_live}
@@ -288,7 +287,7 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
 🔍 Analisa: {note}{tambahan}"""
     await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
 
-# ================== STRONG SETUP REAL-TIME ==================
+# ================== STRONG SETUP ==================
 def is_strong_setup(df_m5, df_m1):
     try:
         ema9_m5 = EMAIndicator(df_m5["close"], window=9).ema_indicator()
@@ -300,7 +299,6 @@ def is_strong_setup(df_m5, df_m1):
         bb_m5 = BollingerBands(df_m5["close"], window=20, window_dev=2)
         bb_high_m5 = bb_m5.bollinger_hband()
         bb_low_m5 = bb_m5.bollinger_lband()
-
         temp5 = df_m5.copy()
         temp5["ema9"], temp5["ema20"], temp5["rsi"], temp5["macd"], temp5["macdsig"], temp5["bb_high"], temp5["bb_low"] = (
             ema9_m5, ema20_m5, rsi_m5, macd_val_m5, macd_sig_m5, bb_high_m5, bb_low_m5
@@ -313,112 +311,79 @@ def is_strong_setup(df_m5, df_m1):
         rsi_m1 = RSIIndicator(df_m1["close"], window=14).rsi()
         stoch_m1 = StochasticOscillator(df_m1["high"], df_m1["low"], df_m1["close"], window=14, smooth_window=3)
         k1, d1 = stoch_m1.stoch(), stoch_m1.stoch_signal()
-
         temp1 = df_m1.copy()
         temp1["ema9"], temp1["ema20"], temp1["rsi"], temp1["k"], temp1["d"] = (ema9_m1, ema20_m1, rsi_m1, k1, d1)
         temp1 = temp1.dropna()
         l1, p1 = temp1.iloc[-1], temp1.iloc[-2]
 
         reasons, buy_score, sell_score = [], 0, 0
-
-        # BUY criteria
         if l5["ema9"] > l5["ema20"]: buy_score += 1; reasons.append("BUY: EMA9>EMA20 (M5)")
         if l5["macd"] > l5["macdsig"]: buy_score += 1; reasons.append("BUY: MACD bullish (M5)")
         if l5["close"] <= l5["bb_low"] or l5["rsi"] < 35: buy_score += 1; reasons.append("BUY: di bawah/low BB atau RSI<35 (M5)")
         if l1["ema9"] > l1["ema20"] and l1["rsi"] > p1["rsi"]: buy_score += 1; reasons.append("BUY: timing M1 searah & RSI naik")
         if l1["k"] > l1["d"] and l1["k"] < 30: buy_score += 1; reasons.append("BUY: Stoch bullish dari area rendah (M1)")
-
-        # SELL criteria
         if l5["ema9"] < l5["ema20"]: sell_score += 1; reasons.append("SELL: EMA9<EMA20 (M5)")
         if l5["macd"] < l5["macdsig"]: sell_score += 1; reasons.append("SELL: MACD bearish (M5)")
         if l5["close"] >= l5["bb_high"] or l5["rsi"] > 65: sell_score += 1; reasons.append("SELL: di atas/high BB atau RSI>65 (M5)")
         if l1["ema9"] < l1["ema20"] and l1["rsi"] < p1["rsi"]: sell_score += 1; reasons.append("SELL: timing M1 searah & RSI turun")
         if l1["k"] < l1["d"] and l1["k"] > 70: sell_score += 1; reasons.append("SELL: Stoch bearish dari area tinggi (M1)")
 
-        if buy_score >= 4 and buy_score > sell_score:
-            return True, "BUY", ", ".join([r for r in reasons if r.startswith("BUY")])
-        if sell_score >= 4 and sell_score > buy_score:
-            return True, "SELL", ", ".join([r for r in reasons if r.startswith("SELL")])
-        return False, None, None
+        if buy_score >= 4 and buy_score > sell_score: return "BUY", reasons
+        if sell_score >= 4 and sell_score > buy_score: return "SELL", reasons
+        return None, reasons
     except Exception as e:
         print(f"❌ Error is_strong_setup: {e}")
-        return False, None, None
+        return None, []
 
 async def monitor_strong_signal(context: ContextTypes.DEFAULT_TYPE):
     global _last_strong_sent_at
     if not is_bot_working_now(): return
-
-    m5 = fetch_twelvedata_series(interval="5min", count=200)
-    m1 = fetch_twelvedata_series(interval="1min", count=60)
-    df5 = prepare_df(m5)
-    df1 = prepare_df(m1)
-    if df5 is None or df1 is None or len(df5) < 30 or len(df1) < 20: return
-
-    strong, arah, alasan = is_strong_setup(df5, df1)
-    if not strong: return
-
-    now = datetime.now(pytz.timezone("Asia/Jakarta"))
-    if _last_strong_sent_at and (now - _last_strong_sent_at) < timedelta(minutes=_strong_cooldown_min):
-        return
-
-    harga_live = fetch_realtime_price_metals() or fetch_realtime_price_twelve() or df1["close"].iloc[-1]
-    tp = round(harga_live + 2.0, 2) if arah=="BUY" else round(harga_live - 2.0, 2)
-    sl = round(harga_live - 1.0, 2) if arah=="BUY" else round(harga_live + 1.0, 2)
-    time_now = now.strftime("%H:%M:%S")
-    tambahan = extra_analysis(df5)
-
-    msg = f"""🔥 *STRONG SETUP — XAU/USD* 🕒 {time_now} WIB
-📈 Arah: *{arah}*
+    if check_high_impact_news(): return
+    df_m5 = prepare_df(fetch_twelvedata_series(interval="5min"))
+    df_m1 = prepare_df(fetch_twelvedata_series(interval="1min", count=120))
+    if df_m5 is None or df_m1 is None: return
+    arah, reasons = is_strong_setup(df_m5, df_m1)
+    if arah:
+        now = datetime.now(pytz.timezone("Asia/Jakarta"))
+        if _last_strong_sent_at and (now - _last_strong_sent_at).total_seconds() < _strong_cooldown_min * 60:
+            return
+        _last_strong_sent_at = now
+        harga_live = fetch_realtime_price_metals() or fetch_realtime_price_twelve() or df_m5["close"].iloc[-1]
+        tp = round(harga_live + 3.0, 2) if arah == "BUY" else round(harga_live - 3.0, 2)
+        sl = round(harga_live - 1.5, 2) if arah == "BUY" else round(harga_live + 1.5, 2)
+        msg = f"""🚨 *STRONG {arah} SETUP* 🚨
 💰 Harga: {harga_live}
 🎯 TP: {tp} 🛑 SL: {sl}
-🧠 Alasan: {alasan}
-🔍 Analisa Tambahan: {tambahan}"""
-    await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
-    _last_strong_sent_at = now
+Alasan:\n- """ + "\n- ".join(reasons)
+        await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
 
-# ================== COMMAND HANDLER ==================
+# ================== HANDLER ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != AUTHORIZED_USER_ID:
-        await update.message.reply_text("🚫 Anda tidak diizinkan.")
+        await update.message.reply_text("❌ Anda tidak berhak pakai bot ini.")
         return
-    await update.message.reply_text("✅ Bot aktif.")
+    await update.message.reply_text("✅ Bot berjalan!")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("/start\n/help\n/info")
+async def manual_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        await update.message.reply_text("❌ Anda tidak berhak pakai bot ini.")
+        return
+    await send_signal(context)
 
-async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Bot sinyal XAU/USD\n"
-        "- Sinyal rutin tiap 60 menit (TF M5)\n"
-        "- STRONG SETUP real-time (scan M1+M5)\n"
-        "- Harga realtime Metals-API (fallback TwelveData)\n"
-        "- News filter otomatis"
-    )
-
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❓ Perintah tidak dikenali.")
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❓ Perintah tidak dikenal.")
 
 # ================== MAIN ==================
 def main():
     keep_alive()
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("info", info_command))
-    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-
-    job_queue = application.job_queue
-    job_queue.run_repeating(send_signal, interval=3600, first=0)
-    job_queue.run_repeating(monitor_strong_signal, interval=60, first=10)
-
-    async def startup(context: ContextTypes.DEFAULT_TYPE):
-        await send_signal(context)
-
-    job_queue.run_once(startup, when=0)
-
-    print("🚀 Bot berjalan...")
-    application.run_polling()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("signal", manual_signal))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+    app.job_queue.run_repeating(send_signal, interval=300, first=10)
+    app.job_queue.run_repeating(monitor_strong_signal, interval=60, first=20)
+    print("🤖 Bot berjalan...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
