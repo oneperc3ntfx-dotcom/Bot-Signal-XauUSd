@@ -1,5 +1,5 @@
 import asyncio
-asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())  # Untuk Python 3.12+
+asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())  # Untuk Python 3.12
 
 from flask import Flask
 from threading import Thread
@@ -11,16 +11,15 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 )
 import pandas as pd
-from ta.momentum import RSIIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
 
 # ================== CONFIG ==================
-BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"  # Token bot kamu
-CHAT_ID = "-1002883903673"  # Grup/Channel ID kamu
-AUTHORIZED_USER_ID = 1305881282  # Hanya kamu yang bisa akses
+BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
+CHAT_ID = "-1002883903673"
+AUTHORIZED_USER_ID = 1305881282
 
-# Multiple API Keys TwelveData (untuk analisa)
 API_KEYS_TWELVE = [
     "94a7d766d73f4db4a7ddf877473711c7",
     "af23649e02da42aab3e78cf343513325",
@@ -34,132 +33,128 @@ def get_active_api_key():
     _current_key_index = (_current_key_index + 1) % len(API_KEYS_TWELVE)
     return key
 
-# Metals API (untuk harga realtime)
 API_KEY_METALS = "2fzz3e9hw1rachdt6jwwo4furz1arvngsm879pg5bj9ucoe2xjjbv4l4gn72"
 
 # ================== FLASK KEEP-ALIVE ==================
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
+app = Flask(__name__)
+@app.route('/')
 def home():
     return "Bot is running"
-
 def keep_alive():
-    Thread(target=lambda: flask_app.run(host='0.0.0.0', port=8080)).start()
+    Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
 
 # ================== MARKET TIME ==================
 def is_bot_working_now():
     now = datetime.now(pytz.timezone("Asia/Jakarta"))
-    weekday = now.weekday()
-    jam = now.time()
-    if weekday == 4 and jam >= time(22, 0):  # Jumat setelah 22:00 WIB
-        return False
-    if weekday in [5, 6]:  # Sabtu & Minggu
-        return False
+    weekday, jam = now.weekday(), now.time()
+    if weekday == 4 and jam >= time(22, 0): return False
+    if weekday in [5, 6]: return False
     return True
 
-# ================== FETCH DATA ==================
-def fetch_candles(symbol="XAU/USD", interval="5min", outputsize=100):
-    key = get_active_api_key()
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={key}&outputsize={outputsize}"
-    try:
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        if "values" not in data:
-            return None
-        df = pd.DataFrame(data["values"])
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df = df.sort_values("datetime")
-        df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
-        return df
-    except:
-        return None
+# ================== DATA FETCHERS ==================
+def fetch_twelvedata_series(symbol="XAU/USD", interval="5min", count=120):
+    for _ in range(len(API_KEYS_TWELVE)):
+        api_key = get_active_api_key()
+        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={api_key}&outputsize={count}&format=JSON"
+        try:
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            if data.get("status") == "error": continue
+            return data.get("values", [])[::-1]
+        except: continue
+    return None
 
-def fetch_price_metals(symbol="XAUUSD"):
-    url = f"https://metals-api.com/api/latest?access_key={API_KEY_METALS}&base=USD&symbols={symbol}"
+def fetch_realtime_price_metals_fast():
     try:
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        return data.get("rates", {}).get(symbol)
-    except:
+        url = f"https://metals-api.com/api/latest?access_key={API_KEY_METALS}&base=USD&symbols=XAU"
+        r = requests.get(url, timeout=5).json()
+        rate = r.get("rates", {}).get("XAU")
+        if rate and rate > 0:
+            return round(1.0 / float(rate), 2)
         return None
+    except: return None
 
-# ================== ANALYSIS ==================
+def fetch_realtime_price_twelve():
+    for _ in range(len(API_KEYS_TWELVE)):
+        api_key = get_active_api_key()
+        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1min&apikey={api_key}&outputsize=1&format=JSON"
+        try:
+            r = requests.get(url, timeout=10).json()
+            if r.get("status") == "error": continue
+            last = r.get("values", [])[0] if r.get("values") else None
+            return float(last["close"]) if last else None
+        except: continue
+    return None
+
+# ================== HELPERS ==================
+def prepare_df(data):
+    if not data: return None
+    df = pd.DataFrame(data)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df.set_index("datetime", inplace=True)
+    for col in ["open","high","low","close"]:
+        df[col] = df[col].astype(float)
+    return df
+
+# ---- Analisa Teknis Lengkap ----
 def analyze(df):
-    result = []
-    close = df["close"]
+    if df is None or len(df) < 20: return []
 
-    # RSI
-    rsi = RSIIndicator(close=close, window=14).rsi().iloc[-1]
-    if rsi < 30:
-        result.append("RSI oversold")
-    elif rsi > 70:
-        result.append("RSI overbought")
+    rsi = RSIIndicator(df["close"], window=14).rsi().iloc[-1]
+    ema20 = EMAIndicator(df["close"], window=20).ema_indicator().iloc[-1]
+    macd_val = MACD(df["close"]).macd().iloc[-1]
+    macd_sig = MACD(df["close"]).macd_signal().iloc[-1]
+    atr = AverageTrueRange(df["high"], df["low"], df["close"]).average_true_range().iloc[-1]
 
-    # EMA
-    ema20 = EMAIndicator(close=close, window=20).ema_indicator().iloc[-1]
-    ema50 = EMAIndicator(close=close, window=50).ema_indicator().iloc[-1]
-    if ema20 > ema50:
-        result.append("Trend bullish (EMA20>EMA50)")
-    else:
-        result.append("Trend bearish (EMA20<EMA50)")
+    # Support & Resistance (20 candle terakhir)
+    recent = df.tail(20)
+    support = recent["low"].min()
+    resistance = recent["high"].max()
 
-    # MACD
-    macd = MACD(close=close)
-    macd_val = macd.macd().iloc[-1]
-    macd_signal = macd.macd_signal().iloc[-1]
-    if macd_val > macd_signal:
-        result.append("MACD bullish crossover")
-    elif macd_val < macd_signal:
-        result.append("MACD bearish crossover")
+    # Fibonacci Retracement (high-low terakhir 50 candle)
+    fib_range = df.tail(50)
+    high, low = fib_range["high"].max(), fib_range["low"].min()
+    fib_618 = high - (high - low) * 0.618
+    fib_500 = high - (high - low) * 0.5
+    fib_382 = high - (high - low) * 0.382
 
-    # ATR
-    atr = AverageTrueRange(
-        high=df["high"], low=df["low"], close=close, window=14
-    ).average_true_range().iloc[-1]
-    result.append(f"ATR: {atr:.2f}")
+    analysis = []
+    analysis.append(f"RSI: {rsi:.2f} ({'Oversold' if rsi<30 else 'Overbought' if rsi>70 else 'Normal'})")
+    analysis.append(f"EMA20 trend: {'Bullish' if df['close'].iloc[-1]>ema20 else 'Bearish'}")
+    analysis.append(f"MACD: {'Bullish' if macd_val>macd_sig else 'Bearish'}")
+    analysis.append(f"ATR(14): {atr:.2f}")
+    analysis.append(f"Support: {support:.2f} | Resistance: {resistance:.2f}")
+    analysis.append(f"Fibo 61.8%: {fib_618:.2f} | 50%: {fib_500:.2f} | 38.2%: {fib_382:.2f}")
 
-    # Support & Resistance (high/low terakhir)
-    support = df["low"].min()
-    resistance = df["high"].max()
-    result.append(f"Support: {support:.2f}, Resistance: {resistance:.2f}")
+    return analysis
 
-    # Fibo (swing high-low)
-    high = df["high"].max()
-    low = df["low"].min()
-    diff = high - low
-    fibo_38 = high - 0.382 * diff
-    fibo_61 = high - 0.618 * diff
-    result.append(f"Fibo 38.2%: {fibo_38:.2f}, 61.8%: {fibo_61:.2f}")
+# ================== MESSAGE ==================
+def format_signal(df, price, analysis):
+    analysis_text = "\n- ".join(analysis)
+    direction = "⬆️ BUY" if "Bullish" in " ".join(analysis) else "⬇️ SELL"
 
-    return result
+    now_wib = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        f"📊 **Gold Trading Signal** 📊\n\n"
+        f"Signal: {direction}\n"
+        f"Price: `{price}`\n\n"
+        f"Analysis:\n- {analysis_text}\n\n"
+        f"🕒 {now_wib} WIB"
+    )
 
-# ================== SIGNAL ==================
+# ================== TASK ==================
 async def send_signal(context: ContextTypes.DEFAULT_TYPE):
-    if not is_bot_working_now():
-        return
+    if not is_bot_working_now(): return
 
-    df = fetch_candles()
-    if df is None:
-        return
-
+    candles = fetch_twelvedata_series(interval="5min")
+    df = prepare_df(candles)
     analysis = analyze(df)
-    price = fetch_price_metals("XAUUSD")
+    if not analysis: return
 
-    direction = "⬆️ BUY" if "bullish" in " ".join(analysis).lower() else "⬇️ SELL"
-    signal_msg = f"""
-📊 Gold Trading Signal
+    harga_live = fetch_realtime_price_metals_fast() or fetch_realtime_price_twelve() or df["close"].iloc[-1]
+    msg = format_signal(df, harga_live, analysis)
 
-Signal: {direction}
-Price: {price}
-
-Analysis:
-- {"\n- ".join(analysis)}
-
-Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-    """
-
-    await context.bot.send_message(chat_id=CHAT_ID, text=signal_msg)
+    await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
 
 # ================== HANDLERS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -185,8 +180,7 @@ def main():
     bot_app.add_handler(CommandHandler("signal", manual_signal))
     bot_app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # Kirim sinyal tiap 30 menit
-    bot_app.job_queue.run_repeating(send_signal, interval=1800, first=10)
+    bot_app.job_queue.run_repeating(send_signal, interval=1800, first=10)  # setiap 30 menit
 
     print("🤖 Bot berjalan...")
     bot_app.run_polling()
