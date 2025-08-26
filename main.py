@@ -416,17 +416,18 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== MAIN ==================
 def main():
     keep_alive()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("signal", manual_signal))
-    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+    bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("signal", manual_signal))
+    bot_app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # Sinyal reguler: tiap 5 menit; Strong scan: tiap 60 detik
-    app.job_queue.run_repeating(send_signal, interval=1800, first=10)  # setiap 30 menit
+    # Sinyal reguler: tiap 30 menit; Strong scan: tiap 60 detik
+    bot_app.job_queue.run_repeating(send_signal, interval=1800, first=10)
     bot_app.job_queue.run_repeating(monitor_strong_signal, interval=60, first=20)
 
     print("🤖 Bot berjalan...")
-    app.run_polling()
+    bot_app.run_polling()
 
 if __name__ == "__main__":
     main()
+
