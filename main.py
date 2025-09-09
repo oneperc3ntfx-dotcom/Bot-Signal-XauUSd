@@ -67,12 +67,9 @@ def fetch_twelvedata_series(symbol="XAU/USD", interval="5min", count=120):
         )
         try:
             response = requests.get(url, timeout=10)
-            if response.status_code != 200:
-                print(f"❌ TwelveData HTTP {response.status_code}")
-                continue
             data = response.json()
-            if data.get("status") == "error":
-                print(f"❌ TwelveData error: {data.get('message')}")
+            if response.status_code != 200 or data.get("status") == "error":
+                print(f"❌ TwelveData error: {data}")
                 continue
             return data.get("values", [])[::-1]  # ascending
         except Exception as e:
@@ -117,6 +114,8 @@ def fetch_realtime_price_twelve():
 # ================== HELPERS ==================
 def prepare_df(data):
     try:
+        if not data:
+            return None
         df = pd.DataFrame(data)
         df["datetime"] = pd.to_datetime(df["datetime"])
         df.set_index("datetime", inplace=True)
@@ -129,7 +128,6 @@ def prepare_df(data):
 
 # ---- Support & Resistance (swing) ----
 def swing_levels(df: pd.DataFrame, lookback=30):
-    """Cari S/R terdekat dari 30 candle terakhir."""
     d = df.tail(lookback)
     swing_high = d["high"].max()
     swing_low = d["low"].min()
@@ -146,7 +144,7 @@ def fib_levels(high, low):
         "0.786": round(high - 0.786 * diff, 2),
     }
 
-# ---- Candlestick Pattern Detection (manual) ----
+# ---- Candlestick Pattern Detection ----
 def detect_candle_patterns(df: pd.DataFrame):
     patterns = []
     if df is None or len(df) < 2:
@@ -216,10 +214,8 @@ def generate_signal(df):
         if last["macd"] > last["macdsig"]:
             score += 1; notes.append("MACD bullish")
 
-        # Arah: momentum candle terakhir
         arah = "BUY" if last["close"] > prev["close"] else "SELL"
 
-        # Tambahan indikator
         try:
             stoch = StochasticOscillator(df["high"], df["low"], df["close"], window=14, smooth_window=3)
             k_val = float(stoch.stoch().iloc[-1])
@@ -247,7 +243,7 @@ def generate_signal(df):
         print(f"❌ Error generate_signal: {e}")
         return None, None, None, None
 
-# ================== MESSAGE (SCALPING STYLE) ==================
+# ================== MESSAGE ==================
 def build_scalping_message(arah: str, price: float, tp1: float, tp2: float, sl: float,
                            status_text: str, indicators: dict, patterns: list,
                            sr_high: float, sr_low: float, fibo: dict):
@@ -275,29 +271,31 @@ def build_scalping_message(arah: str, price: float, tp1: float, tp2: float, sl: 
     )
     return msg
 
-# ================== TASK: KIRIM SINYAL 30 MENIT ==================
+# ================== TASK ==================
 async def send_signal(context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_working_now():
         return
 
-    # Ambil data analisa (M5) dari TwelveData
     candles = fetch_twelvedata_series(interval="5min")
-    df = prepare_df(candles)
-    arah, score, notes, indicators = generate_signal(df)
+    df = prepare_df(candles) if candles else None
+    arah, score, notes, indicators = generate_signal(df) if df is not None else (None, None, None, None)
+
     if arah is None:
+        price_live = fetch_realtime_price_goldapi() or fetch_realtime_price_twelve()
+        if not price_live:
+            return
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"⚠️ Data analisa tidak tersedia (limit TwelveData).\nHarga realtime XAU/USD sekarang: {price_live}"
+        )
         return
 
-    # Candle pattern singkat
     patterns = detect_candle_patterns(df.tail(3))
-
-    # S/R & Fibo
     sr_high, sr_low = swing_levels(df, lookback=30)
     fibo = fib_levels(sr_high, sr_low)
 
-    # Harga eksekusi realtime (Gold-API → TwelveData → last_close)
     price_live = fetch_realtime_price_goldapi() or fetch_realtime_price_twelve() or indicators["last_close"]
 
-    # ====== SCALPING TP/SL ======
     if arah == "BUY":
         tp1 = round(price_live + 2.0, 2)
         tp2 = round(price_live + 4.0, 2)
@@ -351,7 +349,6 @@ def main():
     bot_app.add_handler(CommandHandler("signal", manual_signal))
     bot_app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # Sinyal reguler: tiap 30 menit
     bot_app.job_queue.run_repeating(send_signal, interval=1800, first=10)
 
     print("🤖 Bot berjalan...")
