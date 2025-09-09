@@ -34,9 +34,6 @@ def get_active_api_key():
     _current_key_index = (_current_key_index + 1) % len(API_KEYS_TWELVE)  # round-robin
     return key
 
-# Metals-API (harga eksekusi realtime)
-API_KEY_METALS = "2fzz3e9hw1rachdt6jwwo4furz1arvngsm879pg5bj9ucoe2xjjbv4l4gn72"
-
 # ================== FLASK KEEP-ALIVE ==================
 app = Flask(__name__)
 
@@ -83,23 +80,22 @@ def fetch_twelvedata_series(symbol="XAU/USD", interval="5min", count=120):
             continue
     return None
 
-def fetch_realtime_price_metals_fast():
-    """Ambil harga XAU/USD realtime dari Metals-API (hemat: endpoint latest)."""
+def fetch_realtime_price_goldapi():
+    """Ambil harga XAU/USD realtime dari Gold-API.com"""
     try:
-        url = f"https://metals-api.com/api/latest?access_key={API_KEY_METALS}&base=USD&symbols=XAU"
+        url = "https://api.gold-api.com/price/XAU"
         r = requests.get(url, timeout=5).json()
-        rate = r.get("rates", {}).get("XAU")
-        if rate and rate > 0:
-            # base=USD -> rates.XAU = XAU per 1 USD -> harga USD per XAU = 1/rate
-            return round(1.0 / float(rate), 2)
-        print("❌ Metals-API response:", r)
+        price = r.get("price")
+        if price and price > 0:
+            return round(float(price), 2)
+        print("❌ Gold-API response:", r)
         return None
     except Exception as e:
-        print(f"❌ Error fetch_realtime_price_metals_fast: {e}")
+        print(f"❌ Error fetch_realtime_price_goldapi: {e}")
         return None
 
 def fetch_realtime_price_twelve():
-    """Fallback harga jika Metals-API gagal: ambil close 1m terakhir TwelveData."""
+    """Fallback harga jika Gold-API gagal: ambil close 1m terakhir TwelveData."""
     for _ in range(len(API_KEYS_TWELVE)):
         api_key = get_active_api_key()
         url = (
@@ -220,10 +216,10 @@ def generate_signal(df):
         if last["macd"] > last["macdsig"]:
             score += 1; notes.append("MACD bullish")
 
-        # Arah: momentum candle terakhir (sederhana & cepat untuk scalping)
+        # Arah: momentum candle terakhir
         arah = "BUY" if last["close"] > prev["close"] else "SELL"
 
-        # Tambahan info indikator untuk ringkasan
+        # Tambahan indikator
         try:
             stoch = StochasticOscillator(df["high"], df["low"], df["close"], window=14, smooth_window=3)
             k_val = float(stoch.stoch().iloc[-1])
@@ -291,18 +287,17 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
     if arah is None:
         return
 
-    # Candle pattern singkat (3 candle terakhir)
+    # Candle pattern singkat
     patterns = detect_candle_patterns(df.tail(3))
 
-    # S/R & Fibo dari 30 candle terakhir
+    # S/R & Fibo
     sr_high, sr_low = swing_levels(df, lookback=30)
     fibo = fib_levels(sr_high, sr_low)
 
-    # Harga eksekusi realtime (hemat Metals-API -> /latest)
-    price_live = fetch_realtime_price_metals_fast() or fetch_realtime_price_twelve() or indicators["last_close"]
+    # Harga eksekusi realtime (Gold-API → TwelveData → last_close)
+    price_live = fetch_realtime_price_goldapi() or fetch_realtime_price_twelve() or indicators["last_close"]
 
     # ====== SCALPING TP/SL ======
-    # 1 pip = 0.1 → TP1 20 pips = 2.0 | TP2 40 pips = 4.0 | SL 12 pips = 1.2
     if arah == "BUY":
         tp1 = round(price_live + 2.0, 2)
         tp2 = round(price_live + 4.0, 2)
@@ -312,10 +307,8 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         tp2 = round(price_live - 4.0, 2)
         sl  = round(price_live + 1.2, 2)
 
-    # Status text (KUAT/MODERAT/LEMAH)
     status_text = "🟢 KUAT" if score >= 3 else ("🟡 SEDANG" if score == 2 else "🔴 LEMAH")
 
-    # Bangun pesan (singkat)
     msg = build_scalping_message(
         arah=arah,
         price=price_live,
@@ -328,9 +321,7 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         fibo=fibo
     )
 
-    # (Opsional) catatan ringkas dari scoring (1-2 baris)
     if notes:
-        # Ambil max 2 baris agar tetap singkat
         extra = "\n".join([f"• {line}" for line in notes.split("\n")][:2])
         msg += f"\n📝 Note:\n{extra}"
 
@@ -360,7 +351,7 @@ def main():
     bot_app.add_handler(CommandHandler("signal", manual_signal))
     bot_app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # Sinyal reguler: tiap 30 menit (sesuai permintaan)
+    # Sinyal reguler: tiap 30 menit
     bot_app.job_queue.run_repeating(send_signal, interval=1800, first=10)
 
     print("🤖 Bot berjalan...")
