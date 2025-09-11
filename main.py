@@ -14,7 +14,6 @@ import pandas as pd
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
-import time as t
 
 # ================== CONFIG ==================
 BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
@@ -47,8 +46,10 @@ def keep_alive():
     Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
 
 # ================== MARKET TIME ==================
+JKT = pytz.timezone("Asia/Jakarta")
+
 def is_bot_working_now():
-    now = datetime.now(pytz.timezone("Asia/Jakarta"))
+    now = datetime.now(JKT)
     weekday = now.weekday()
     jam = now.time()
     if weekday == 4 and jam >= time(22, 0):
@@ -63,11 +64,18 @@ def fetch_twelvedata_series(symbol="XAU/USD", interval="5min", count=50):
         api_key = get_active_api_key()
         url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={api_key}&outputsize={count}&format=JSON"
         try:
-            r = requests.get(url, timeout=10).json()
-            if r.get("status") == "error":
-                print(f"❌ TwelveData error: {r.get('message')}")
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+            # debug print if needed:
+            # print("TwelveData resp:", data)
+            if resp.status_code != 200 or data.get("status") == "error":
+                print(f"❌ TwelveData error: {data}")
                 continue
-            return r.get("values", [])[::-1]
+            values = data.get("values", [])
+            if not values:
+                print("❌ TwelveData: empty values")
+                continue
+            return values[::-1]  # ascending
         except Exception as e:
             print(f"❌ Error fetch_twelvedata_series: {e}")
             continue
@@ -77,11 +85,20 @@ def fetch_realtime_price_goldapi():
     try:
         url = "https://api.gold-api.com/price/XAU"
         r = requests.get(url, timeout=5).json()
+        # debug print:
+        # print("Gold-API resp:", r)
         price = r.get("price")
-        if price and price > 0:
-            return round(float(price), 2)
-        print("❌ Gold-API response:", r)
-        return None
+        if price is None:
+            # some endpoints return nested structure; log full response
+            print("❌ Gold-API response (no price):", r)
+            return None
+        # ensure numeric
+        try:
+            price_f = float(price)
+            return round(price_f, 2)
+        except Exception:
+            print("❌ Gold-API price not numeric:", price)
+            return None
     except Exception as e:
         print(f"❌ Error fetch_realtime_price_goldapi: {e}")
         return None
@@ -91,12 +108,17 @@ def fetch_realtime_price_twelve():
         api_key = get_active_api_key()
         url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1min&apikey={api_key}&outputsize=1&format=JSON"
         try:
-            r = requests.get(url, timeout=10).json()
-            if r.get("status") == "error":
-                print(f"❌ TwelveData price error: {r.get('message')}")
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            if r.status_code != 200 or data.get("status") == "error":
+                print(f"❌ TwelveData price error: {data}")
                 continue
-            last = r.get("values", [])[0] if r.get("values") else None
-            return float(last["close"]) if last else None
+            vals = data.get("values", [])
+            if not vals:
+                print("❌ TwelveData price: empty values")
+                continue
+            last = vals[0]
+            return float(last["close"])
         except Exception as e:
             print(f"❌ Error fetch_realtime_price_twelve: {e}")
             continue
@@ -108,10 +130,17 @@ def prepare_df(data):
         if not data:
             return None
         df = pd.DataFrame(data)
+        if "datetime" not in df.columns:
+            print("❌ prepare_df: 'datetime' column missing")
+            return None
         df["datetime"] = pd.to_datetime(df["datetime"])
         df.set_index("datetime", inplace=True)
         for col in ["open", "high", "low", "close"]:
-            df[col] = df[col].astype(float)
+            if col in df.columns:
+                df[col] = df[col].astype(float)
+            else:
+                print(f"❌ prepare_df: missing column {col}")
+                return None
         return df
     except Exception as e:
         print(f"❌ Error prepare_df: {e}")
@@ -166,25 +195,54 @@ def detect_candle_patterns(df: pd.DataFrame):
     return patterns
 
 def generate_signal(df):
-    if df is None or len(df) < 7:
+    """
+    Compute indicators on the full dataframe (to ensure enough history for indicators),
+    then analyze the last 7 candles (last candle + 6 previous) for decision.
+    Requires df to be at least 30 rows for reliable indicator calculations.
+    """
+    if df is None or len(df) < 30:
+        # Not enough history for indicators like EMA20/MACD/RSI reliably
+        print("⚠️ generate_signal: insufficient data length for indicators")
         return None, None, None, None
+
     try:
-        df_analyze = df.tail(7)  # candle terakhir + 6 candle sebelumnya
-        rsi = RSIIndicator(df_analyze["close"], window=14).rsi()
-        ema9 = EMAIndicator(df_analyze["close"], window=9).ema_indicator()
-        ema20 = EMAIndicator(df_analyze["close"], window=20).ema_indicator()
-        macd_calc = MACD(close=df_analyze["close"], window_slow=26, window_fast=12, window_sign=9)
-        macd_val = macd_calc.macd()
-        macd_sig = macd_calc.macd_signal()
-        df_analyze["rsi"], df_analyze["ema9"], df_analyze["ema20"], df_analyze["macd"], df_analyze["macdsig"] = rsi, ema9, ema20, macd_val, macd_sig
-        df_analyze.dropna(inplace=True)
+        # Compute indicators on the full df to have enough lookback
+        df_full = df.copy()
+        # RSI, EMA, MACD on full series
+        rsi_full = RSIIndicator(df_full["close"], window=14).rsi()
+        ema9_full = EMAIndicator(df_full["close"], window=9).ema_indicator()
+        ema20_full = EMAIndicator(df_full["close"], window=20).ema_indicator()
+        macd_calc_full = MACD(close=df_full["close"], window_slow=26, window_fast=12, window_sign=9)
+        macd_full = macd_calc_full.macd()
+        macd_sig_full = macd_calc_full.macd_signal()
+
+        # Now take last 7 candles for decision
+        df_analyze = df_full.tail(7).copy()  # make an explicit copy to avoid SettingWithCopyWarning
+
+        # Attach indicator slices aligned to df_analyze indices using .loc
+        # Using .reindex to align index (should match)
+        df_analyze.loc[:, "rsi"] = rsi_full.reindex(df_analyze.index)
+        df_analyze.loc[:, "ema9"] = ema9_full.reindex(df_analyze.index)
+        df_analyze.loc[:, "ema20"] = ema20_full.reindex(df_analyze.index)
+        df_analyze.loc[:, "macd"] = macd_full.reindex(df_analyze.index)
+        df_analyze.loc[:, "macdsig"] = macd_sig_full.reindex(df_analyze.index)
+
+        # Drop rows which have NaN after indicator calculation
+        df_analyze = df_analyze.dropna()
+        if df_analyze.empty or len(df_analyze) < 2:
+            print("⚠️ generate_signal: not enough valid rows after indicator calculation")
+            return None, None, None, None
+
         last = df_analyze.iloc[-1]
         prev = df_analyze.iloc[-2]
 
         score = 0
         notes = []
-        if last["rsi"] < 30 and last["close"] > last["ema9"]:
-            score += 1; notes.append("RSI oversold + >EMA9")
+        try:
+            if last["rsi"] < 30 and last["close"] > last["ema9"]:
+                score += 1; notes.append("RSI oversold + >EMA9")
+        except Exception:
+            pass
         if last["close"] > prev["close"]:
             score += 1; notes.append("Harga naik vs candle sebelumnya")
         if last["close"] > last["ema20"]:
@@ -194,10 +252,20 @@ def generate_signal(df):
 
         arah = "BUY" if last["close"] > prev["close"] else "SELL"
 
-        stoch = StochasticOscillator(df_analyze["high"], df_analyze["low"], df_analyze["close"], window=14, smooth_window=3)
-        k_val = float(stoch.stoch().iloc[-1])
-        d_val = float(stoch.stoch_signal().iloc[-1])
-        atr = float(AverageTrueRange(df_analyze["high"], df_analyze["low"], df_analyze["close"], window=14).average_true_range().iloc[-1])
+        # Stochastic & ATR computed on the df_full then reindexed
+        try:
+            stoch_full = StochasticOscillator(df_full["high"], df_full["low"], df_full["close"], window=14, smooth_window=3)
+            k_full = stoch_full.stoch()
+            d_full = stoch_full.stoch_signal()
+            k_val = float(k_full.reindex(df_analyze.index).iloc[-1])
+            d_val = float(d_full.reindex(df_analyze.index).iloc[-1])
+        except Exception:
+            k_val = d_val = float("nan")
+        try:
+            atr_full = AverageTrueRange(df_full["high"], df_full["low"], df_full["close"], window=14).average_true_range()
+            atr = float(atr_full.reindex(df_analyze.index).iloc[-1])
+        except Exception:
+            atr = float("nan")
 
         indicators = {
             "rsi": float(last["rsi"]),
@@ -216,7 +284,7 @@ def generate_signal(df):
         return None, None, None, None
 
 def build_scalping_message(arah, price, tp1, tp2, sl, status_text, indicators, patterns, sr_high, sr_low, fibo):
-    now_wib = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+    now_wib = datetime.now(JKT).strftime("%H:%M:%S")
     pat_txt = ", ".join(patterns) if patterns else "-"
     trend_txt = "bullish" if indicators["last_close"] > indicators["ema20"] else "bearish"
     msg = (
@@ -240,7 +308,11 @@ def build_scalping_message(arah, price, tp1, tp2, sl, status_text, indicators, p
 
 # ================== TASK ==================
 async def send_signal(context: ContextTypes.DEFAULT_TYPE):
+    """
+    context is the CallbackContext provided by job_queue.
+    """
     if not is_bot_working_now():
+        print("⏸️ Market closed now, skipping signal.")
         return
 
     candles = fetch_twelvedata_series(interval="5min", count=50)
@@ -250,10 +322,11 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
     if arah is None:
         price_live = fetch_realtime_price_goldapi() or fetch_realtime_price_twelve()
         if not price_live:
+            print("❌ All price sources failed, skipping.")
             return
         await context.bot.send_message(
             chat_id=CHAT_ID,
-            text=f"⚠️ Data analisa tidak tersedia (limit TwelveData).\nHarga realtime XAU/USD sekarang: {price_live}"
+            text=f"⚠️ Data analisa tidak tersedia (TwelveData).\\nHarga realtime XAU/USD sekarang: {price_live}"
         )
         return
 
@@ -316,16 +389,21 @@ def main():
     bot_app.add_handler(CommandHandler("signal", manual_signal))
     bot_app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # Job schedule: setiap jam di menit 01
-    async def schedule_hourly():
-        while True:
-            now = datetime.now(pytz.timezone("Asia/Jakarta"))
-            next_run = (now.replace(minute=1, second=0, microsecond=0) + timedelta(hours=1)) if now.minute >= 1 else now.replace(minute=1, second=0, microsecond=0)
-            wait_seconds = (next_run - now).total_seconds()
-            await asyncio.sleep(wait_seconds)
-            await send_signal(bot_app)
+    # schedule: setiap jam pada menit 01
+    now = datetime.now(JKT)
+    if now.minute >= 1:
+        next_run = (now.replace(minute=1, second=0, microsecond=0) + timedelta(hours=1))
+    else:
+        next_run = now.replace(minute=1, second=0, microsecond=0)
+    wait_seconds = (next_run - now).total_seconds()
+    print(f"⏱️ First scheduled signal in {int(wait_seconds)} seconds at {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
-    bot_app.job_queue.run_repeating(lambda c: asyncio.create_task(schedule_hourly()), interval=3600, first=0)
+    # job callback wrapper
+    async def job_callback(context: ContextTypes.DEFAULT_TYPE):
+        await send_signal(context)
+
+    # register repeating job: interval 3600 seconds, first run after wait_seconds
+    bot_app.job_queue.run_repeating(job_callback, interval=3600, first=wait_seconds)
 
     print("🤖 Bot berjalan...")
     bot_app.run_polling()
