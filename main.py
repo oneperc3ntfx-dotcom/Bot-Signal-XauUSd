@@ -1,6 +1,8 @@
 import asyncio
-import threading
+asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())  # untuk Python 3.12+
+
 from flask import Flask
+from threading import Thread
 import requests
 from datetime import datetime, timedelta
 import pytz
@@ -12,6 +14,7 @@ from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 )
+
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
@@ -21,9 +24,6 @@ BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
 CHAT_ID = "-1002903040446"  # ID channel
 AUTHORIZED_USER_ID = 1305881282  # hanya kamu
 
-# Finnhub API key (sesuai yang kamu berikan)
-FINNHUB_API_KEY = "d3ih5cpr01qmn7fk333gd3ih5cpr01qmn7fk3340"
-
 DATA_DIR = "data"
 DB_PATH = os.path.join(DATA_DIR, "xauusd_m5.db")
 PAIR_SYMBOL = "XAUUSD"
@@ -32,7 +32,7 @@ CANDLE_INTERVAL_MIN = 5
 JKT = pytz.timezone("Asia/Jakarta")
 
 tick_buckets = {}
-last_signal_time = None  # untuk mencegah duplikat
+last_signal_time = None  # anti duplikat signal
 
 # ================== FLASK KEEP-ALIVE ==================
 app = Flask(__name__)
@@ -42,7 +42,7 @@ def home():
     return "Bot is running."
 
 def keep_alive():
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080), daemon=True).start()
+    Thread(target=lambda: app.run(host='0.0.0.0', port=8080), daemon=True).start()
 
 # ================== DB SETUP ==================
 def init_db():
@@ -85,41 +85,28 @@ def get_last_n_candles(n=200):
         df[c] = df[c].astype(float)
     return df
 
-# ================== PRICE SOURCES ==================
-def fetch_price_finnhub():
-    try:
-        # Finnhub symbol for gold spot (OANDA feed)
-        symbol = "OANDA:XAU_USD"
-        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        j = r.json()
-        # 'c' is current price
-        if "c" in j and j["c"] and float(j["c"]) > 0:
-            return float(j["c"])
-        else:
-            print("⚠️ Finnhub returned no price or zero:", j)
-    except Exception as e:
-        print("❌ fetch_price_finnhub error:", e)
-    return None
-
+# ================== PRICE SOURCE (FreeForexAPI) ==================
 def fetch_price_freeforex():
-    # fallback simple source (keamanan jika Finnhub error)
+    """
+    FreeForexAPI returns JSON like: {"rates": {"XAUUSD": {"rate": 1920.12}}}
+    Note: freeforexapi might have downtime; that's why we keep robust error handling.
+    """
     try:
         url = f"https://www.freeforexapi.com/api/live?pairs={PAIR_SYMBOL}"
         r = requests.get(url, timeout=8)
         r.raise_for_status()
         j = r.json()
         if "rates" in j and PAIR_SYMBOL in j["rates"]:
-            return float(j["rates"][PAIR_SYMBOL]["rate"])
+            rate = j["rates"][PAIR_SYMBOL].get("rate") if isinstance(j["rates"][PAIR_SYMBOL], dict) else j["rates"][PAIR_SYMBOL]
+            if rate:
+                return float(rate)
     except Exception as e:
         print("❌ fetch_price_freeforex error:", e)
     return None
 
 def fetch_price():
-    price = fetch_price_finnhub()
-    if price is None:
-        price = fetch_price_freeforex()
+    # primary (FreeForex) - can add more sources here later
+    price = fetch_price_freeforex()
     return price
 
 # ================== CANDLE AGGREGATION ==================
@@ -138,7 +125,6 @@ def close_old_buckets():
     now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
     for key in list(tick_buckets.keys()):
         bucket_dt = datetime.strptime(key, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.utc)
-        # jika bucket sudah lewat 5 menit (sudah selesai), simpan ke DB
         if now_utc >= bucket_dt + timedelta(minutes=CANDLE_INTERVAL_MIN):
             prices = tick_buckets.pop(key, [])
             if prices:
@@ -173,7 +159,7 @@ def generate_signal(df):
         if df is None or len(df) < 30:
             return None, None, None, None
 
-        # hitung indikator pada keseluruhan df agar indikator punya history
+        # compute indicators on full series
         rsi = RSIIndicator(df["close"], 14).rsi()
         ema9 = EMAIndicator(df["close"], 9).ema_indicator()
         ema20 = EMAIndicator(df["close"], 20).ema_indicator()
@@ -181,13 +167,14 @@ def generate_signal(df):
         macd = macd_calc.macd()
         macd_sig = macd_calc.macd_signal()
 
-        # buat salinan kecil (tidak mengubah df asli)
+        # copy and attach indicator values aligned to index
         df_work = df.copy()
         df_work.loc[:, "rsi"] = rsi
         df_work.loc[:, "ema9"] = ema9
         df_work.loc[:, "ema20"] = ema20
         df_work.loc[:, "macd"] = macd
         df_work.loc[:, "macdsig"] = macd_sig
+
         df_work = df_work.dropna()
         if df_work.empty or len(df_work) < 2:
             print("⚠️ generate_signal: not enough valid rows after indicators")
@@ -208,7 +195,7 @@ def generate_signal(df):
         if last["macd"] > last["macdsig"]:
             score += 1; notes.append("MACD bullish")
 
-        # tambahan indikator ATR & Stoch (dihitung pada seluruh series lalu ambil value terakhir)
+        # stochastic & atr from full df
         try:
             stoch = StochasticOscillator(df["high"], df["low"], df["close"], window=14, smooth_window=3)
             k_val = float(stoch.stoch().iloc[-1])
@@ -265,10 +252,9 @@ async def send_signal(app_bot):
         print("⚠️ Not enough candle data for analysis.")
         return
 
-    # hindari duplikat: cek last_signal_time hours
     now = datetime.now(JKT)
+    # hindari duplikat dengan jangka waktu 50 menit
     if last_signal_time and (now - last_signal_time) < timedelta(minutes=50):
-        # safety check: jika sudah mengirim dalam 50 menit terakhir skip
         print("⏸️ Signal recently sent, skipping.")
         return
 
@@ -329,32 +315,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return  # ignore unknown commands
 
-# ================== RUN BOT (thread-safe) ==================
-def run_bot():
-    async def main():
-        app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
-        app_bot.add_handler(CommandHandler("start", start))
-        app_bot.add_handler(MessageHandler(filters.COMMAND, unknown))
+# ================== RUN BOT (main thread) ==================
+async def main_bot():
+    app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-        # start background tasks inside the bot loop
-        asyncio.create_task(ticker_task())
-        asyncio.create_task(schedule_task(app_bot))
+    # start background tasks inside the bot loop
+    asyncio.create_task(ticker_task())
+    asyncio.create_task(schedule_task(app_bot))
 
-        print("🤖 Telegram bot starting (polling)...")
-        await app_bot.run_polling()
-
-    # run the bot loop inside this thread
-    asyncio.run(main())
+    print("🤖 Telegram bot starting (polling)...")
+    await app_bot.run_polling()
 
 if __name__ == "__main__":
-    keep_alive()               # Flask keep-alive in background thread
-    threading.Thread(target=run_bot, daemon=True).start()  # Bot runs in separate thread
-    print("🤖 Bot & keep-alive started. Main thread idle.")
-    # keep main thread alive (so container doesn't exit)
+    # start flask keep-alive in background thread
+    keep_alive()
+
+    # run bot and asyncio tasks in main thread event loop
     try:
-        while True:
-            # just sleep main thread
-            threading.Event().wait(3600)
-    except KeyboardInterrupt:
+        asyncio.run(main_bot())
+    except (KeyboardInterrupt, SystemExit):
         print("Shutdown requested, exiting...")
 
