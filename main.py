@@ -1,15 +1,20 @@
 import asyncio
-asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())  # Untuk Python 3.12
+asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())  # Untuk Python 3.12+
 
 from flask import Flask
 from threading import Thread
 import requests
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 import pytz
+import sqlite3
+import os
+import time
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 )
+
 import pandas as pd
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import EMAIndicator, MACD
@@ -20,20 +25,16 @@ BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
 CHAT_ID = "-1002883903673"
 AUTHORIZED_USER_ID = 1305881282
 
-# Multiple API Keys TwelveData (analisa)
-API_KEYS_TWELVE = [
-    "94a7d766d73f4db4a7ddf877473711c7",
-    "af23649e02da42aab3e78cf343513325",
-    "21a0860958e641cc934bec6277415088",
-    "841e95162faf457e8d80207a75c3ca2c",
-]
-_current_key_index = 0
+DATA_DIR = "data"
+DB_PATH = os.path.join(DATA_DIR, "xauusd_m5.db")
+PAIR_SYMBOL = "XAUUSD"  # freeforex uses XAUUSD
+TICK_INTERVAL_SECONDS = 60  # ambil harga tiap 60 detik
+CANDLE_INTERVAL_MIN = 5  # M5
 
-def get_active_api_key():
-    global _current_key_index
-    key = API_KEYS_TWELVE[_current_key_index]
-    _current_key_index = (_current_key_index + 1) % len(API_KEYS_TWELVE)
-    return key
+JKT = pytz.timezone("Asia/Jakarta")
+
+# in-memory tick buckets: {bucket_time_iso: [prices]}
+tick_buckets = {}
 
 # ================== FLASK KEEP-ALIVE ==================
 app = Flask(__name__)
@@ -45,132 +46,142 @@ def home():
 def keep_alive():
     Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
 
-# ================== MARKET TIME ==================
-JKT = pytz.timezone("Asia/Jakarta")
+# ================== DB HELPERS ==================
+def init_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS candles (
+            dt TEXT PRIMARY KEY,  -- ISO timestamp aligned to candle start UTC
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL
+        )
+    """)
+    conn.commit()
+    return conn
 
-def is_bot_working_now():
-    now = datetime.now(JKT)
-    weekday = now.weekday()
-    jam = now.time()
-    if weekday == 4 and jam >= time(22, 0):
-        return False
-    if weekday in [5, 6]:
-        return False
-    return True
+db_conn = init_db()
 
-# ================== DATA FETCHERS ==================
-def fetch_twelvedata_series(symbol="XAU/USD", interval="5min", count=50):
-    for _ in range(len(API_KEYS_TWELVE)):
-        api_key = get_active_api_key()
-        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={api_key}&outputsize={count}&format=JSON"
-        try:
-            resp = requests.get(url, timeout=10)
-            data = resp.json()
-            # debug print if needed:
-            # print("TwelveData resp:", data)
-            if resp.status_code != 200 or data.get("status") == "error":
-                print(f"❌ TwelveData error: {data}")
-                continue
-            values = data.get("values", [])
-            if not values:
-                print("❌ TwelveData: empty values")
-                continue
-            return values[::-1]  # ascending
-        except Exception as e:
-            print(f"❌ Error fetch_twelvedata_series: {e}")
-            continue
+def insert_candle(dt: datetime, o, h, l, c):
+    iso = dt.strftime("%Y-%m-%d %H:%M:%S")
+    cur = db_conn.cursor()
+    try:
+        cur.execute("INSERT OR REPLACE INTO candles (dt, open, high, low, close) VALUES (?, ?, ?, ?, ?)",
+                    (iso, o, h, l, c))
+        db_conn.commit()
+        print(f"✅ Inserted candle {iso} O:{o} H:{h} L:{l} C:{c}")
+        return True
+    except Exception as e:
+        print("❌ insert_candle error:", e)
+        return False
+
+def get_last_n_candles(n=100):
+    cur = db_conn.cursor()
+    cur.execute("SELECT dt, open, high, low, close FROM candles ORDER BY dt DESC LIMIT ?", (n,))
+    rows = cur.fetchall()
+    if not rows:
+        return None
+    df = pd.DataFrame(rows, columns=["datetime", "open", "high", "low", "close"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.set_index("datetime").sort_index()
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+    return df
+
+def get_last_candle_time():
+    cur = db_conn.cursor()
+    cur.execute("SELECT dt FROM candles ORDER BY dt DESC LIMIT 1")
+    row = cur.fetchone()
+    if not row:
+        return None
+    return datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+
+# ================== FREEFOREX API (tick fetch) ==================
+def fetch_price_freeforex():
+    try:
+        url = f"https://www.freeforexapi.com/api/live?pairs={PAIR_SYMBOL}"
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        j = r.json()
+        if "rates" in j and PAIR_SYMBOL in j["rates"]:
+            rate = float(j["rates"][PAIR_SYMBOL]["rate"])
+            return rate
+        print("❌ freeforex invalid response:", j)
+    except Exception as e:
+        print("❌ fetch_price_freeforex error:", e)
     return None
 
-def fetch_realtime_price_goldapi():
-    try:
-        url = "https://api.gold-api.com/price/XAU"
-        r = requests.get(url, timeout=5).json()
-        # debug print:
-        # print("Gold-API resp:", r)
-        price = r.get("price")
-        if price is None:
-            # some endpoints return nested structure; log full response
-            print("❌ Gold-API response (no price):", r)
-            return None
-        # ensure numeric
-        try:
-            price_f = float(price)
-            return round(price_f, 2)
-        except Exception:
-            print("❌ Gold-API price not numeric:", price)
-            return None
-    except Exception as e:
-        print(f"❌ Error fetch_realtime_price_goldapi: {e}")
-        return None
+# ================== BUCKET / CANDLE LOGIC ==================
+def floor_to_5min(dt: datetime):
+    # floor to nearest multiple of 5 minutes (UTC)
+    minute = (dt.minute // CANDLE_INTERVAL_MIN) * CANDLE_INTERVAL_MIN
+    return dt.replace(minute=minute, second=0, microsecond=0)
 
-def fetch_realtime_price_twelve():
-    for _ in range(len(API_KEYS_TWELVE)):
-        api_key = get_active_api_key()
-        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1min&apikey={api_key}&outputsize=1&format=JSON"
+def add_tick_to_bucket(ts: datetime, price: float):
+    # use UTC bucket key
+    ts_utc = ts.astimezone(pytz.utc)
+    bucket = floor_to_5min(ts_utc)
+    key = bucket.strftime("%Y-%m-%d %H:%M:%S")
+    if key not in tick_buckets:
+        tick_buckets[key] = []
+    tick_buckets[key].append((ts_utc, price))
+    # attempt to close buckets older than one full interval
+    try_close_buckets()
+
+def try_close_buckets():
+    now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+    keys_to_close = []
+    for key in list(tick_buckets.keys()):
+        bucket_dt = datetime.strptime(key, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.utc)
+        # close bucket if bucket end < now (i.e., bucket <= now - interval)
+        if bucket_dt + timedelta(minutes=CANDLE_INTERVAL_MIN) <= now_utc:
+            keys_to_close.append(key)
+    for k in keys_to_close:
+        ticks = tick_buckets.pop(k, [])
+        if ticks:
+            # aggregate
+            prices = [p for (_t, p) in ticks]
+            o = prices[0]
+            c = prices[-1]
+            h = max(prices)
+            l = min(prices)
+        else:
+            # no ticks: fallback to last DB close
+            last_df = get_last_n_candles(1)
+            if last_df is None:
+                continue
+            last_close = float(last_df["close"].iloc[-1])
+            o = h = l = c = last_close
+        bucket_dt = datetime.strptime(k, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.utc)
+        # store as UTC ISO; analysis uses this DB
+        insert_candle(bucket_dt, o, h, l, c)
+        # after insert, trigger analysis/send signal
+        # we cannot await here (called from sync context), so schedule task in event loop
         try:
-            r = requests.get(url, timeout=10)
-            data = r.json()
-            if r.status_code != 200 or data.get("status") == "error":
-                print(f"❌ TwelveData price error: {data}")
-                continue
-            vals = data.get("values", [])
-            if not vals:
-                print("❌ TwelveData price: empty values")
-                continue
-            last = vals[0]
-            return float(last["close"])
+            loop = asyncio.get_event_loop()
+            loop.create_task(on_new_candle(bucket_dt))
         except Exception as e:
-            print(f"❌ Error fetch_realtime_price_twelve: {e}")
-            continue
-    return None
+            print("❌ schedule on_new_candle failed:", e)
 
-# ================== HELPERS ==================
-def prepare_df(data):
-    try:
-        if not data:
-            return None
-        df = pd.DataFrame(data)
-        if "datetime" not in df.columns:
-            print("❌ prepare_df: 'datetime' column missing")
-            return None
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df.set_index("datetime", inplace=True)
-        for col in ["open", "high", "low", "close"]:
-            if col in df.columns:
-                df[col] = df[col].astype(float)
-            else:
-                print(f"❌ prepare_df: missing column {col}")
-                return None
-        return df
-    except Exception as e:
-        print(f"❌ Error prepare_df: {e}")
+# ================== ANALYSIS & SIGNAL ==================
+def prepare_df_for_analysis(df: pd.DataFrame):
+    # ensure enough rows and proper types
+    if df is None or len(df) < 30:
         return None
+    return df
 
-def swing_levels(df: pd.DataFrame, lookback=30):
-    d = df.tail(lookback)
-    swing_high = d["high"].max()
-    swing_low = d["low"].min()
-    return swing_high, swing_low
-
-def fib_levels(high, low):
-    diff = high - low
-    return {
-        "0.236": round(high - 0.236 * diff, 2),
-        "0.382": round(high - 0.382 * diff, 2),
-        "0.500": round(high - 0.5   * diff, 2),
-        "0.618": round(high - 0.618 * diff, 2),
-        "0.786": round(high - 0.786 * diff, 2),
-    }
-
-def detect_candle_patterns(df: pd.DataFrame):
+def detect_candle_patterns_from_df(df: pd.DataFrame):
+    # reuse simple patterns logic (last 3)
     patterns = []
     if df is None or len(df) < 2:
         return patterns
     d = df.copy()
     last = d.iloc[-1]
     prev = d.iloc[-2]
-
-    def body(c):  return abs(c["close"] - c["open"])
+    def body(c): return abs(c["close"] - c["open"])
     def range_(c): return c["high"] - c["low"]
     def upper_wick(c): return c["high"] - max(c["close"], c["open"])
     def lower_wick(c): return min(c["close"], c["open"]) - c["low"]
@@ -185,30 +196,15 @@ def detect_candle_patterns(df: pd.DataFrame):
         patterns.append("📈 Bullish Engulfing")
     if (last["close"] < last["open"] and prev["close"] > prev["open"] and last["close"] < prev["open"] and last["open"] > prev["close"]):
         patterns.append("📉 Bearish Engulfing")
-
-    if len(d) >= 3:
-        c1, c2, c3 = d.iloc[-3], d.iloc[-2], d.iloc[-1]
-        if (c1["close"] < c1["open"] and abs(c2["close"]-c2["open"]) <= 0.5 * abs(c1["close"]-c1["open"]) and c3["close"] > c3["open"] and c3["close"] >= (c1["open"] + c1["close"]) / 2):
-            patterns.append("🌅 Morning Star")
-        if (c1["close"] > c1["open"] and abs(c2["close"]-c2["open"]) <= 0.5 * abs(c1["close"]-c1["open"]) and c3["close"] < c3["open"] and c3["close"] <= (c1["open"] + c1["close"]) / 2):
-            patterns.append("🌆 Evening Star")
     return patterns
 
-def generate_signal(df):
-    """
-    Compute indicators on the full dataframe (to ensure enough history for indicators),
-    then analyze the last 7 candles (last candle + 6 previous) for decision.
-    Requires df to be at least 30 rows for reliable indicator calculations.
-    """
+def generate_signal_from_df(df: pd.DataFrame):
+    # copy of your generate_signal but adapted to use stored df
     if df is None or len(df) < 30:
-        # Not enough history for indicators like EMA20/MACD/RSI reliably
         print("⚠️ generate_signal: insufficient data length for indicators")
         return None, None, None, None
-
     try:
-        # Compute indicators on the full df to have enough lookback
         df_full = df.copy()
-        # RSI, EMA, MACD on full series
         rsi_full = RSIIndicator(df_full["close"], window=14).rsi()
         ema9_full = EMAIndicator(df_full["close"], window=9).ema_indicator()
         ema20_full = EMAIndicator(df_full["close"], window=20).ema_indicator()
@@ -216,18 +212,12 @@ def generate_signal(df):
         macd_full = macd_calc_full.macd()
         macd_sig_full = macd_calc_full.macd_signal()
 
-        # Now take last 7 candles for decision
-        df_analyze = df_full.tail(7).copy()  # make an explicit copy to avoid SettingWithCopyWarning
-
-        # Attach indicator slices aligned to df_analyze indices using .loc
-        # Using .reindex to align index (should match)
+        df_analyze = df_full.tail(7).copy()
         df_analyze.loc[:, "rsi"] = rsi_full.reindex(df_analyze.index)
         df_analyze.loc[:, "ema9"] = ema9_full.reindex(df_analyze.index)
         df_analyze.loc[:, "ema20"] = ema20_full.reindex(df_analyze.index)
         df_analyze.loc[:, "macd"] = macd_full.reindex(df_analyze.index)
         df_analyze.loc[:, "macdsig"] = macd_sig_full.reindex(df_analyze.index)
-
-        # Drop rows which have NaN after indicator calculation
         df_analyze = df_analyze.dropna()
         if df_analyze.empty or len(df_analyze) < 2:
             print("⚠️ generate_signal: not enough valid rows after indicator calculation")
@@ -235,7 +225,6 @@ def generate_signal(df):
 
         last = df_analyze.iloc[-1]
         prev = df_analyze.iloc[-2]
-
         score = 0
         notes = []
         try:
@@ -252,7 +241,7 @@ def generate_signal(df):
 
         arah = "BUY" if last["close"] > prev["close"] else "SELL"
 
-        # Stochastic & ATR computed on the df_full then reindexed
+        # Stochastic & ATR
         try:
             stoch_full = StochasticOscillator(df_full["high"], df_full["low"], df_full["close"], window=14, smooth_window=3)
             k_full = stoch_full.stoch()
@@ -280,7 +269,7 @@ def generate_signal(df):
         }
         return arah, score, "\n".join(notes), indicators
     except Exception as e:
-        print(f"❌ Error generate_signal: {e}")
+        print("❌ Error generate_signal_from_df:", e)
         return None, None, None, None
 
 def build_scalping_message(arah, price, tp1, tp2, sl, status_text, indicators, patterns, sr_high, sr_low, fibo):
@@ -306,35 +295,26 @@ def build_scalping_message(arah, price, tp1, tp2, sl, status_text, indicators, p
     )
     return msg
 
-# ================== TASK ==================
-async def send_signal(context: ContextTypes.DEFAULT_TYPE):
-    """
-    context is the CallbackContext provided by job_queue.
-    """
-    if not is_bot_working_now():
-        print("⏸️ Market closed now, skipping signal.")
+# ================== ON NEW CANDLE (async) ==================
+async def on_new_candle(bucket_dt):
+    # called whenever a new M5 candle is stored
+    # run analysis using last N candles and send signal
+    df = get_last_n_candles(200)
+    df_analysis = prepare_df_for_analysis(df)
+    if df_analysis is None:
+        print("⏳ on_new_candle: not enough historical data yet.")
         return
-
-    candles = fetch_twelvedata_series(interval="5min", count=50)
-    df = prepare_df(candles) if candles else None
-    arah, score, notes, indicators = generate_signal(df) if df is not None else (None, None, None, None)
-
+    arah, score, notes, indicators = generate_signal_from_df(df_analysis)
     if arah is None:
-        price_live = fetch_realtime_price_goldapi() or fetch_realtime_price_twelve()
-        if not price_live:
-            print("❌ All price sources failed, skipping.")
-            return
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"⚠️ Data analisa tidak tersedia (TwelveData).\\nHarga realtime XAU/USD sekarang: {price_live}"
-        )
+        print("⚠️ on_new_candle: signal generation failed.")
         return
-
-    patterns = detect_candle_patterns(df.tail(7))
-    sr_high, sr_low = swing_levels(df, lookback=30)
-    fibo = fib_levels(sr_high, sr_low)
-
-    price_live = fetch_realtime_price_goldapi() or fetch_realtime_price_twelve() or indicators["last_close"]
+    patterns = detect_candle_patterns_from_df(df_analysis.tail(7))
+    sr_high, sr_low = df_analysis["high"].tail(30).max(), df_analysis["low"].tail(30).min()
+    fibo = {
+        "0.382": round(sr_high - 0.382 * (sr_high - sr_low), 2),
+        "0.618": round(sr_high - 0.618 * (sr_high - sr_low), 2),
+    }
+    price_live = indicators["last_close"]
 
     if arah == "BUY":
         tp1 = round(price_live + 2.0, 2)
@@ -358,14 +338,35 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE):
         sr_low=round(sr_low, 2),
         fibo=fibo
     )
-
     if notes:
         extra = "\n".join([f"• {line}" for line in notes.split("\n")][:2])
         msg += f"\n📝 Note:\n{extra}"
 
-    await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+    # send to Telegram
+    try:
+        app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+        async with app_bot:
+            await app_bot.bot.send_message(chat_id=CHAT_ID, text=msg)
+        print("📨 Signal sent.")
+    except Exception as e:
+        print("❌ send signal error:", e)
 
-# ================== HANDLERS ==================
+# ================== SCHEDULED TICKER (async) ==================
+async def ticker_task():
+    while True:
+        try:
+            price = fetch_price_freeforex()
+            now = datetime.utcnow().replace(tzinfo=pytz.utc)
+            if price is not None:
+                add_tick_to_bucket(now, price)
+                print(f"tick {now.strftime('%Y-%m-%d %H:%M:%S')} price={price}")
+            else:
+                print("⚠️ ticker: price fetch returned None")
+        except Exception as e:
+            print("❌ ticker_task loop error:", e)
+        await asyncio.sleep(TICK_INTERVAL_SECONDS)
+
+# ================== BOT HANDLERS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != AUTHORIZED_USER_ID:
         await update.message.reply_text("❌ Anda tidak berhak pakai bot ini.")
@@ -376,7 +377,30 @@ async def manual_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != AUTHORIZED_USER_ID:
         await update.message.reply_text("❌ Anda tidak berhak pakai bot ini.")
         return
-    await send_signal(context)
+    # run analysis immediately on demand
+    df = get_last_n_candles(200)
+    df_analysis = prepare_df_for_analysis(df)
+    if df_analysis is None:
+        await update.message.reply_text("⏳ Data historis belum cukup untuk analisa.")
+        return
+    arah, score, notes, indicators = generate_signal_from_df(df_analysis)
+    if arah is None:
+        await update.message.reply_text("❌ Gagal membuat sinyal sekarang.")
+        return
+    patterns = detect_candle_patterns_from_df(df_analysis.tail(7))
+    sr_high, sr_low = df_analysis["high"].tail(30).max(), df_analysis["low"].tail(30).min()
+    fibo = {"0.382": round(sr_high - 0.382 * (sr_high - sr_low), 2), "0.618": round(sr_high - 0.618 * (sr_high - sr_low), 2)}
+    price_live = indicators["last_close"]
+    if arah == "BUY":
+        tp1 = round(price_live + 2.0, 2); tp2 = round(price_live + 4.0, 2); sl = round(price_live - 1.2, 2)
+    else:
+        tp1 = round(price_live - 2.0, 2); tp2 = round(price_live - 4.0, 2); sl = round(price_live + 1.2, 2)
+    status_text = "🟢 KUAT" if score >= 3 else ("🟡 SEDANG" if score == 2 else "🔴 LEMAH")
+    msg = build_scalping_message(arah, price_live, tp1, tp2, sl, status_text, indicators, patterns, round(sr_high,2), round(sr_low,2), fibo)
+    if notes:
+        extra = "\n".join([f"• {line}" for line in notes.split("\n")][:2])
+        msg += f"\n📝 Note:\n{extra}"
+    await update.message.reply_text(msg)
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ Perintah tidak dikenal.")
@@ -384,29 +408,25 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== MAIN ==================
 def main():
     keep_alive()
+
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("signal", manual_signal))
     bot_app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # schedule: setiap jam pada menit 01
-    now = datetime.now(JKT)
-    if now.minute >= 1:
-        next_run = (now.replace(minute=1, second=0, microsecond=0) + timedelta(hours=1))
-    else:
-        next_run = now.replace(minute=1, second=0, microsecond=0)
-    wait_seconds = (next_run - now).total_seconds()
-    print(f"⏱️ First scheduled signal in {int(wait_seconds)} seconds at {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-
-    # job callback wrapper
-    async def job_callback(context: ContextTypes.DEFAULT_TYPE):
-        await send_signal(context)
-
-    # register repeating job: interval 3600 seconds, first run after wait_seconds
-    bot_app.job_queue.run_repeating(job_callback, interval=3600, first=wait_seconds)
+    # Start ticker_task in background when bot starts
+    async def runner():
+        # start ticker
+        task = asyncio.create_task(ticker_task())
+        await task
 
     print("🤖 Bot berjalan...")
-    bot_app.run_polling()
+    # run the bot and background tasks
+    bot_app.run_polling(bootstrap_retries=-1, close_loop=False, run_async=True)
+    # run our runner in event loop
+    loop = asyncio.get_event_loop()
+    loop.create_task(runner())
+    loop.run_forever()
 
 if __name__ == "__main__":
     main()
