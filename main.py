@@ -1,8 +1,6 @@
 import asyncio
-asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())  # untuk Python 3.12+
-
+import threading
 from flask import Flask
-from threading import Thread
 import requests
 from datetime import datetime, timedelta
 import pytz
@@ -14,7 +12,6 @@ from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 )
-
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
@@ -24,6 +21,9 @@ BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
 CHAT_ID = "-1002903040446"  # ID channel
 AUTHORIZED_USER_ID = 1305881282  # hanya kamu
 
+# Finnhub API key (sesuai yang kamu berikan)
+FINNHUB_API_KEY = "d3ih5cpr01qmn7fk333gd3ih5cpr01qmn7fk3340"
+
 DATA_DIR = "data"
 DB_PATH = os.path.join(DATA_DIR, "xauusd_m5.db")
 PAIR_SYMBOL = "XAUUSD"
@@ -32,7 +32,7 @@ CANDLE_INTERVAL_MIN = 5
 JKT = pytz.timezone("Asia/Jakarta")
 
 tick_buckets = {}
-last_signal_time = None  # anti duplikat signal
+last_signal_time = None  # untuk mencegah duplikat
 
 # ================== FLASK KEEP-ALIVE ==================
 app = Flask(__name__)
@@ -42,7 +42,7 @@ def home():
     return "Bot is running."
 
 def keep_alive():
-    Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080), daemon=True).start()
 
 # ================== DB SETUP ==================
 def init_db():
@@ -85,8 +85,26 @@ def get_last_n_candles(n=200):
         df[c] = df[c].astype(float)
     return df
 
-# ================== FETCH PRICE ==================
+# ================== PRICE SOURCES ==================
+def fetch_price_finnhub():
+    try:
+        # Finnhub symbol for gold spot (OANDA feed)
+        symbol = "OANDA:XAU_USD"
+        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        j = r.json()
+        # 'c' is current price
+        if "c" in j and j["c"] and float(j["c"]) > 0:
+            return float(j["c"])
+        else:
+            print("⚠️ Finnhub returned no price or zero:", j)
+    except Exception as e:
+        print("❌ fetch_price_finnhub error:", e)
+    return None
+
 def fetch_price_freeforex():
+    # fallback simple source (keamanan jika Finnhub error)
     try:
         url = f"https://www.freeforexapi.com/api/live?pairs={PAIR_SYMBOL}"
         r = requests.get(url, timeout=8)
@@ -98,11 +116,18 @@ def fetch_price_freeforex():
         print("❌ fetch_price_freeforex error:", e)
     return None
 
+def fetch_price():
+    price = fetch_price_finnhub()
+    if price is None:
+        price = fetch_price_freeforex()
+    return price
+
 # ================== CANDLE AGGREGATION ==================
 def floor_to_5min(dt):
     return dt.replace(minute=(dt.minute // CANDLE_INTERVAL_MIN) * CANDLE_INTERVAL_MIN, second=0, microsecond=0)
 
 def add_tick(ts, price):
+    # ts expected timezone-aware (UTC)
     ts_utc = ts.astimezone(pytz.utc)
     bucket = floor_to_5min(ts_utc)
     key = bucket.strftime("%Y-%m-%d %H:%M:%S")
@@ -113,10 +138,14 @@ def close_old_buckets():
     now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
     for key in list(tick_buckets.keys()):
         bucket_dt = datetime.strptime(key, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.utc)
+        # jika bucket sudah lewat 5 menit (sudah selesai), simpan ke DB
         if now_utc >= bucket_dt + timedelta(minutes=CANDLE_INTERVAL_MIN):
             prices = tick_buckets.pop(key, [])
             if prices:
-                insert_candle(bucket_dt, prices[0], max(prices), min(prices), prices[-1])
+                try:
+                    insert_candle(bucket_dt, prices[0], max(prices), min(prices), prices[-1])
+                except Exception as e:
+                    print("❌ Error inserting aggregated candle:", e)
 
 # ================== INDICATOR ANALYSIS ==================
 def prepare_df(df):
@@ -126,7 +155,8 @@ def prepare_df(df):
 
 def detect_patterns(df):
     patterns = []
-    if len(df) < 2: return patterns
+    if df is None or len(df) < 2:
+        return patterns
     last, prev = df.iloc[-1], df.iloc[-2]
     body = abs(last["close"] - last["open"])
     rng = last["high"] - last["low"]
@@ -140,35 +170,66 @@ def detect_patterns(df):
 
 def generate_signal(df):
     try:
-        if df is None or len(df) < 30: return None, None, None, None
+        if df is None or len(df) < 30:
+            return None, None, None, None
+
+        # hitung indikator pada keseluruhan df agar indikator punya history
         rsi = RSIIndicator(df["close"], 14).rsi()
         ema9 = EMAIndicator(df["close"], 9).ema_indicator()
         ema20 = EMAIndicator(df["close"], 20).ema_indicator()
         macd_calc = MACD(df["close"], 12, 26, 9)
-        macd, macdsig = macd_calc.macd(), macd_calc.macd_signal()
+        macd = macd_calc.macd()
+        macd_sig = macd_calc.macd_signal()
 
-        df["rsi"] = rsi
-        df["ema9"] = ema9
-        df["ema20"] = ema20
-        df["macd"] = macd
-        df["macdsig"] = macdsig
+        # buat salinan kecil (tidak mengubah df asli)
+        df_work = df.copy()
+        df_work.loc[:, "rsi"] = rsi
+        df_work.loc[:, "ema9"] = ema9
+        df_work.loc[:, "ema20"] = ema20
+        df_work.loc[:, "macd"] = macd
+        df_work.loc[:, "macdsig"] = macd_sig
+        df_work = df_work.dropna()
+        if df_work.empty or len(df_work) < 2:
+            print("⚠️ generate_signal: not enough valid rows after indicators")
+            return None, None, None, None
 
-        last, prev = df.iloc[-1], df.iloc[-2]
+        last = df_work.iloc[-1]
+        prev = df_work.iloc[-2]
+
         arah = "BUY" if last["close"] > prev["close"] else "SELL"
         score = 0
         notes = []
-        if last["rsi"] < 30: score += 1; notes.append("RSI Oversold")
-        if last["close"] > last["ema20"]: score += 1; notes.append("Trend Up")
-        if last["macd"] > last["macdsig"]: score += 1; notes.append("MACD Bullish")
+        if last["rsi"] < 30 and last["close"] > last["ema9"]:
+            score += 1; notes.append("RSI oversold + >EMA9")
+        if last["close"] > prev["close"]:
+            score += 1; notes.append("Harga naik vs candle sebelumnya")
+        if last["close"] > last["ema20"]:
+            score += 1; notes.append(">EMA20 (trend naik)")
+        if last["macd"] > last["macdsig"]:
+            score += 1; notes.append("MACD bullish")
 
-        atr = AverageTrueRange(df["high"], df["low"], df["close"], 14).average_true_range().iloc[-1]
+        # tambahan indikator ATR & Stoch (dihitung pada seluruh series lalu ambil value terakhir)
+        try:
+            stoch = StochasticOscillator(df["high"], df["low"], df["close"], window=14, smooth_window=3)
+            k_val = float(stoch.stoch().iloc[-1])
+            d_val = float(stoch.stoch_signal().iloc[-1])
+        except Exception:
+            k_val = d_val = float("nan")
+        try:
+            atr = float(AverageTrueRange(df["high"], df["low"], df["close"], 14).average_true_range().iloc[-1])
+        except Exception:
+            atr = float("nan")
+
         indicators = {
-            "rsi": last["rsi"],
-            "ema20": last["ema20"],
-            "macd": last["macd"],
-            "macdsig": last["macdsig"],
+            "rsi": float(last["rsi"]),
+            "ema9": float(last["ema9"]),
+            "ema20": float(last["ema20"]),
+            "macd": float(last["macd"]),
+            "macdsig": float(last["macdsig"]),
+            "stoch_k": k_val,
+            "stoch_d": d_val,
             "atr": atr,
-            "last_close": last["close"]
+            "last_close": float(last["close"]),
         }
         return arah, score, "\n".join(notes), indicators
     except Exception as e:
@@ -196,84 +257,104 @@ def build_message(arah, price, tp1, tp2, sl, status, indicators, patterns):
     return msg
 
 # ================== SIGNAL TASK ==================
-async def send_signal(bot_app):
+async def send_signal(app_bot):
     global last_signal_time
     df = get_last_n_candles(200)
     df = prepare_df(df)
     if df is None:
-        print("⚠️ Not enough candle data.")
+        print("⚠️ Not enough candle data for analysis.")
         return
 
-    # anti duplikat
-    now_hour = datetime.now(JKT).strftime("%Y-%m-%d %H:00")
-    if last_signal_time == now_hour:
-        print("⏸️ Already sent signal for this hour.")
+    # hindari duplikat: cek last_signal_time hours
+    now = datetime.now(JKT)
+    if last_signal_time and (now - last_signal_time) < timedelta(minutes=50):
+        # safety check: jika sudah mengirim dalam 50 menit terakhir skip
+        print("⏸️ Signal recently sent, skipping.")
         return
-    last_signal_time = now_hour
 
     arah, score, notes, indicators = generate_signal(df)
-    if arah is None: return
+    if arah is None:
+        print("⚠️ generate_signal returned None.")
+        return
+
     patterns = detect_patterns(df)
     price = indicators["last_close"]
 
     if arah == "BUY":
-        tp1, tp2, sl = round(price+2,2), round(price+4,2), round(price-1.2,2)
+        tp1, tp2, sl = round(price + 2.0, 2), round(price + 4.0, 2), round(price - 1.2, 2)
     else:
-        tp1, tp2, sl = round(price-2,2), round(price-4,2), round(price+1.2,2)
+        tp1, tp2, sl = round(price - 2.0, 2), round(price - 4.0, 2), round(price + 1.2, 2)
 
-    status = "🟢 KUAT" if score>=3 else ("🟡 SEDANG" if score==2 else "🔴 LEMAH")
+    status = "🟢 KUAT" if score >= 3 else ("🟡 SEDANG" if score == 2 else "🔴 LEMAH")
     msg = build_message(arah, price, tp1, tp2, sl, status, indicators, patterns)
-    if notes: msg += f"\n\n📝 Note:\n{notes}"
+    if notes:
+        msg += f"\n\n📝 Note:\n{notes}"
 
     try:
-        await bot_app.bot.send_message(chat_id=CHAT_ID, text=msg)
-        print(f"📨 Signal sent at {datetime.now(JKT)}")
+        await app_bot.bot.send_message(chat_id=CHAT_ID, text=msg)
+        last_signal_time = datetime.now(JKT)
+        print(f"✅ Signal sent at {last_signal_time}")
     except Exception as e:
         print("❌ send_signal error:", e)
 
-async def scheduled_task(bot_app):
-    while True:
-        now = datetime.now(JKT)
-        next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        wait = (next_hour - now).total_seconds()
-        print(f"⏱️ Next signal scheduled at {next_hour.strftime('%Y-%m-%d %H:%M:%S')} WIB")
-        await asyncio.sleep(wait)
-        await send_signal(bot_app)
-
-# ================== BOT HANDLERS ==================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id == AUTHORIZED_USER_ID:
-        await update.message.reply_text("✅ Bot aktif dan siap mengirim sinyal otomatis.")
-    else:
-        return
-
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return  # tidak balas apapun
-
-# ================== MAIN ==================
+# ================== LOOP TASKS ==================
 async def ticker_task():
     while True:
-        price = fetch_price_freeforex()
+        price = fetch_price()
         if price:
             now = datetime.utcnow().replace(tzinfo=pytz.utc)
             add_tick(now, price)
             print(f"tick {now.strftime('%H:%M:%S')} price={price}")
         await asyncio.sleep(TICK_INTERVAL_SECONDS)
 
-def main():
-    keep_alive()
-    async def start_all():
-        bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
-        bot_app.add_handler(CommandHandler("start", start))
-        bot_app.add_handler(MessageHandler(filters.COMMAND, unknown))
+async def schedule_task(app_bot):
+    # kirim setiap jam di menit 00 (00:00, 01:00, 02:00, ...)
+    while True:
+        now = datetime.now(JKT)
+        next_run = now.replace(minute=0, second=0, microsecond=0)
+        if now >= next_run:
+            next_run = next_run + timedelta(hours=1)
+        wait = (next_run - now).total_seconds()
+        print(f"⏱️ Next scheduled signal at {next_run.strftime('%Y-%m-%d %H:%M:%S')} WIB (in {int(wait)}s)")
+        await asyncio.sleep(wait)
+        await send_signal(app_bot)
 
+# ================== BOT HANDLERS ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_user.id == AUTHORIZED_USER_ID:
+        await update.message.reply_text("✅ Bot aktif dan siap mengirim sinyal otomatis.")
+    else:
+        await update.message.reply_text("👋 Halo.")
+
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return  # ignore unknown commands
+
+# ================== RUN BOT (thread-safe) ==================
+def run_bot():
+    async def main():
+        app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+        app_bot.add_handler(CommandHandler("start", start))
+        app_bot.add_handler(MessageHandler(filters.COMMAND, unknown))
+
+        # start background tasks inside the bot loop
         asyncio.create_task(ticker_task())
-        asyncio.create_task(scheduled_task(bot_app))
+        asyncio.create_task(schedule_task(app_bot))
 
-        print("🤖 Bot berjalan...")
-        await bot_app.run_polling()
+        print("🤖 Telegram bot starting (polling)...")
+        await app_bot.run_polling()
 
-    asyncio.run(start_all())
+    # run the bot loop inside this thread
+    asyncio.run(main())
 
 if __name__ == "__main__":
-    main()
+    keep_alive()               # Flask keep-alive in background thread
+    threading.Thread(target=run_bot, daemon=True).start()  # Bot runs in separate thread
+    print("🤖 Bot & keep-alive started. Main thread idle.")
+    # keep main thread alive (so container doesn't exit)
+    try:
+        while True:
+            # just sleep main thread
+            threading.Event().wait(3600)
+    except KeyboardInterrupt:
+        print("Shutdown requested, exiting...")
+
