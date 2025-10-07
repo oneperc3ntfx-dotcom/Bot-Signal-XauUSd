@@ -22,7 +22,7 @@ from ta.volatility import AverageTrueRange
 
 # ================== CONFIG ==================
 BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
-CHAT_ID = "-1002883903673"
+CHAT_ID = "-1002903040446"
 AUTHORIZED_USER_ID = 1305881282
 
 DATA_DIR = "data"
@@ -409,24 +409,26 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     keep_alive()
 
-    bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("signal", manual_signal))
-    bot_app.add_handler(MessageHandler(filters.COMMAND, unknown))
+    async def start_all():
+        bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
+        bot_app.add_handler(CommandHandler("start", start))
+        bot_app.add_handler(CommandHandler("signal", manual_signal))
+        bot_app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # Start ticker_task in background when bot starts
-    async def runner():
-        # start ticker
-        task = asyncio.create_task(ticker_task())
-        await task
+        # start background ticker task
+        ticker = asyncio.create_task(ticker_task())
 
-    print("🤖 Bot berjalan...")
-    # run the bot and background tasks
-    bot_app.run_polling(bootstrap_retries=-1, close_loop=False, run_async=True)
-    # run our runner in event loop
-    loop = asyncio.get_event_loop()
-    loop.create_task(runner())
-    loop.run_forever()
+        print("🤖 Bot berjalan...")
+        # run polling (this will keep running until stopped)
+        await bot_app.run_polling()
+        # if run_polling returns (bot stopped), cancel ticker
+        ticker.cancel()
+        try:
+            await ticker
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(start_all())
 
 if __name__ == "__main__":
     main()
