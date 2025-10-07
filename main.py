@@ -21,7 +21,7 @@ from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
 
 # ================== CONFIG ==================
-BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
+BOT_TOKEN = "7678173969:AAEUvVsRqbsHV-oUeky54CVytf_9nU9Fi5c"
 CHAT_ID = "-1002903040446"
 AUTHORIZED_USER_ID = 1305881282
 
