@@ -1,8 +1,7 @@
-requests
-pandas
-beautifulsoup4
-python-telegram-bot[job-queue]==20.3
-ta
-pytz
-nest_asyncio
-flask
+Flask==2.3.2
+requests==2.31.0
+pandas==2.2.3
+numpy==1.26.4
+python-telegram-bot==20.5
+pytz==2024.7
+ta==0.12.2
