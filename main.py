@@ -30,7 +30,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 AUTHORIZED_USER_ID = int(os.environ.get("AUTHORIZED_USER_ID", "0"))
 TD_API_KEYS = [k.strip() for k in os.environ.get("TD_API_KEYS", "").split(",") if k.strip()]
-PAIR_SYMBOL = os.environ.get("PAIR_SYMBOL", "XAU/USD")  # Twelve Data symbol
+PAIR_SYMBOL = os.environ.get("PAIR_SYMBOL", "XAU/USD")
 FLASK_PORT = int(os.environ.get("PORT", "8080"))
 DATA_DIR = os.environ.get("DATA_DIR", "data")
 CANDLES_CSV = os.path.join(DATA_DIR, "candles.csv")
@@ -65,16 +65,13 @@ def keep_alive():
 os.makedirs(DATA_DIR, exist_ok=True)
 
 def save_candles_df(df: pd.DataFrame):
-    """Save candles DataFrame to CSV (index is datetime)"""
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
         df_sorted = df.sort_index()
         df_sorted.to_csv(CANDLES_CSV, float_format="%.6f")
     except Exception as e:
         print("❌ save_candles_df error:", e)
 
 def load_candles_df():
-    """Load candles from CSV if exists. Returns DataFrame indexed by datetime or None."""
     try:
         if not os.path.exists(CANDLES_CSV):
             return None
@@ -89,7 +86,6 @@ def load_candles_df():
 
 # --------------- Twelve Data fetchers ---------------
 def fetch_price_twelvedata():
-    """Get latest price from Twelve Data /price endpoint."""
     try:
         key = _next_td_key()
         if not key:
@@ -108,9 +104,6 @@ def fetch_price_twelvedata():
     return None
 
 def fetch_historical_5m(outputsize=500):
-    """Fetch historical 5-min candles from Twelve Data time_series endpoint.
-       Returns DataFrame indexed by datetime UTC.
-    """
     try:
         key = _next_td_key()
         if not key:
@@ -130,10 +123,8 @@ def fetch_historical_5m(outputsize=500):
             print("⚠️ TwelveData /time_series response:", j)
             return None
         values = j["values"]
-        # TwelveData returns newest-first; convert to DataFrame oldest-first
         rows = []
         for v in reversed(values):
-            # v has datetime, open, high, low, close, volume maybe
             rows.append({
                 "datetime": pd.to_datetime(v["datetime"]),
                 "open": float(v["open"]),
@@ -155,7 +146,6 @@ def floor_to_bucket(dt_utc):
 def add_tick(ts_utc, price):
     key = floor_to_bucket(ts_utc)
     tick_buckets.setdefault(key, []).append(price)
-    # close buckets older than one interval and persist
     close_old_buckets()
 
 def close_old_buckets():
@@ -166,7 +156,6 @@ def close_old_buckets():
             prices = tick_buckets.pop(k, [])
             if prices:
                 o, h, l, c = prices[0], max(prices), min(prices), prices[-1]
-                # append to CSV / DataFrame
                 df = load_candles_df()
                 arr = {"datetime": [k], "open":[o], "high":[h], "low":[l], "close":[c]}
                 new = pd.DataFrame(arr).set_index("datetime")
@@ -235,7 +224,6 @@ def generate_signal(df):
             score += 1; notes.append("Close > EMA20 (trend naik)")
         if last["macd"] > last["macdsig"]:
             score += 1; notes.append("MACD bullish crossover")
-        # stochastic & atr
         try:
             stoch = StochasticOscillator(df["high"], df["low"], df["close"], window=14, smooth_window=3)
             k_val = float(stoch.stoch().iloc[-1])
@@ -290,7 +278,6 @@ def build_message(arah, price, tp1, tp2, sl, status, indicators, patterns, score
 
 # --------------- working hours ---------------
 def is_working_time(now_jkt: datetime):
-    # Mon-Fri (0..4), hours 07..21 inclusive
     wd_ok = now_jkt.weekday() <= 4
     hr_ok = 7 <= now_jkt.hour <= 21
     return wd_ok and hr_ok
@@ -301,7 +288,6 @@ last_signal_time = None
 async def send_signal(app_bot, force=False):
     global last_signal_time
     df = load_candles_df()
-    # if we don't have enough candles, try to fetch historical
     if df is None or len(df) < 60:
         fetched = fetch_historical_5m(outputsize=500)
         if fetched is not None:
@@ -318,7 +304,6 @@ async def send_signal(app_bot, force=False):
         return
     arah, score, notes, indicators = generate_signal(df)
     if arah is None:
-        # fallback: create minimal message from realtime price
         price = fetch_price_twelvedata() or float("nan")
         msg = (
             f"📡 Sinyal XAU/USD\n"
@@ -360,7 +345,6 @@ async def ticker_task():
         await asyncio.sleep(TICK_INTERVAL_SECONDS)
 
 async def schedule_task(app_bot):
-    # immediate send if within working hours
     now_jkt = datetime.now(JKT)
     if is_working_time(now_jkt):
         print("🚀 First-run during working hours: sending immediate signal.")
@@ -393,19 +377,15 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
 # --------------- run bot ---------------
-async def main_bot():
+def main():
+    keep_alive()
     app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
     app_bot.add_handler(CommandHandler("start", start_cmd))
     app_bot.add_handler(MessageHandler(filters.COMMAND, unknown))
-    # background tasks
     asyncio.create_task(ticker_task())
     asyncio.create_task(schedule_task(app_bot))
     print("🤖 Telegram bot starting (polling)...")
-    await app_bot.run_polling()
+    app_bot.run_polling()  # ⚡ run_polling manages event loop itself
 
 if __name__ == "__main__":
-    keep_alive()
-    try:
-        asyncio.run(main_bot())
-    except (KeyboardInterrupt, SystemExit):
-        print("Shutdown requested, exiting...")
+    main()
