@@ -1,156 +1,184 @@
-import asyncio
-asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())  # untuk Python 3.12+
-
-from flask import Flask
-from threading import Thread
-import requests
-from datetime import datetime, timedelta, time as dtime
-import pytz
-import sqlite3
+#!/usr/bin/env python3
+"""
+Main bot script:
+- Uses Twelve Data for price & historical 5-min candles.
+- Aggregates ticks into 5-min candles (also can load historical candles on startup).
+- Sends signal immediately on deploy if within working hours (Mon-Fri 07:00-21:00 WIB),
+  and every hour at minute :00 within working hours.
+- Persists candles to data/candles.csv (simple CSV).
+- No sqlite dependency.
+"""
 import os
-import pandas as pd
+import asyncio
 import random
-
+from threading import Thread
+from datetime import datetime, timedelta
+import pytz
+import requests
+import pandas as pd
+from flask import Flask
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
+# TA libs
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
 
-# ================== CONFIG ==================
-BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
-CHAT_ID = "-1003142698012"  # ID channel
-AUTHORIZED_USER_ID = 1305881282  # hanya kamu
+# --------------- CONFIG (from ENV) ---------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
+AUTHORIZED_USER_ID = int(os.environ.get("AUTHORIZED_USER_ID", "0"))
+TD_API_KEYS = [k.strip() for k in os.environ.get("TD_API_KEYS", "").split(",") if k.strip()]
+PAIR_SYMBOL = os.environ.get("PAIR_SYMBOL", "XAU/USD")  # Twelve Data symbol
+FLASK_PORT = int(os.environ.get("PORT", "8080"))
+DATA_DIR = os.environ.get("DATA_DIR", "data")
+CANDLES_CSV = os.path.join(DATA_DIR, "candles.csv")
 
-DATA_DIR = "data"
-DB_PATH = os.path.join(DATA_DIR, "xauusd_m5.db")
-PAIR_SYMBOL = "XAU/USD"  # Twelve Data expects "XAU/USD"
-TICK_INTERVAL_SECONDS = 60
-CANDLE_INTERVAL_MIN = 5
+# runtime config
+TICK_INTERVAL_SECONDS = int(os.environ.get("TICK_INTERVAL_SECONDS", "60"))
+CANDLE_INTERVAL_MIN = int(os.environ.get("CANDLE_INTERVAL_MIN", "5"))
 JKT = pytz.timezone("Asia/Jakarta")
 
-# Twelve Data API keys (rotasi)
-TD_API_KEYS = [
-    "21a0860958e641cc934bec6277415088",
-    "af23649e02da42aab3e78cf343513325",
-    "94a7d766d73f4db4a7ddf877473711c7"
-]
-_td_key_index = 0
+if not BOT_TOKEN or not CHAT_ID or not TD_API_KEYS:
+    raise SystemExit("ERROR: BOT_TOKEN, CHAT_ID and TD_API_KEYS must be set in environment")
 
-tick_buckets = {}
-last_signal_time = None  # anti duplikat signal
+# --------------- simple key rotation ---------------
+_td_key_index = random.randrange(len(TD_API_KEYS)) if TD_API_KEYS else 0
+def _next_td_key():
+    global _td_key_index
+    if not TD_API_KEYS:
+        return None
+    _td_key_index = (_td_key_index + 1) % len(TD_API_KEYS)
+    return TD_API_KEYS[_td_key_index]
 
-# ================== FLASK KEEP-ALIVE ==================
+# --------------- Flask keep-alive ---------------
 app = Flask(__name__)
-
-@app.route('/')
+@app.route("/")
 def home():
     return "Bot is running."
 
 def keep_alive():
-    Thread(target=lambda: app.run(host='0.0.0.0', port=8080), daemon=True).start()
+    Thread(target=lambda: app.run(host="0.0.0.0", port=FLASK_PORT), daemon=True).start()
 
-# ================== DB SETUP ==================
-def init_db():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS candles (
-            dt TEXT PRIMARY KEY,
-            open REAL, high REAL, low REAL, close REAL
-        )
-    """)
-    conn.commit()
-    return conn
+# --------------- candle storage (CSV) ---------------
+os.makedirs(DATA_DIR, exist_ok=True)
 
-db_conn = init_db()
-
-def insert_candle(dt, o, h, l, c):
+def save_candles_df(df: pd.DataFrame):
+    """Save candles DataFrame to CSV (index is datetime)"""
     try:
-        cur = db_conn.cursor()
-        cur.execute(
-            "INSERT OR REPLACE INTO candles (dt, open, high, low, close) VALUES (?, ?, ?, ?, ?)",
-            (dt.strftime("%Y-%m-%d %H:%M:%S"), o, h, l, c)
-        )
-        db_conn.commit()
-        print(f"✅ Inserted {dt} O:{o} H:{h} L:{l} C:{c}")
+        os.makedirs(DATA_DIR, exist_ok=True)
+        df_sorted = df.sort_index()
+        df_sorted.to_csv(CANDLES_CSV, float_format="%.6f")
     except Exception as e:
-        print("❌ insert_candle error:", e)
+        print("❌ save_candles_df error:", e)
 
-def get_last_n_candles(n=200):
-    cur = db_conn.cursor()
-    cur.execute("SELECT dt, open, high, low, close FROM candles ORDER BY dt DESC LIMIT ?", (n,))
-    rows = cur.fetchall()
-    if not rows:
+def load_candles_df():
+    """Load candles from CSV if exists. Returns DataFrame indexed by datetime or None."""
+    try:
+        if not os.path.exists(CANDLES_CSV):
+            return None
+        df = pd.read_csv(CANDLES_CSV, parse_dates=["datetime"])
+        df = df.set_index("datetime").sort_index()
+        for c in ["open", "high", "low", "close"]:
+            df[c] = df[c].astype(float)
+        return df
+    except Exception as e:
+        print("❌ load_candles_df error:", e)
         return None
-    df = pd.DataFrame(rows, columns=["datetime", "open", "high", "low", "close"])
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.set_index("datetime").sort_index()
-    for c in ["open", "high", "low", "close"]:
-        df[c] = df[c].astype(float)
-    return df
 
-# ================== PRICE SOURCE (Twelve Data) ==================
-def _next_td_key():
-    global _td_key_index
-    # simple round-robin or randomize to spread load
-    _td_key_index = (_td_key_index + 1) % len(TD_API_KEYS)
-    return TD_API_KEYS[_td_key_index]
-
+# --------------- Twelve Data fetchers ---------------
 def fetch_price_twelvedata():
-    """
-    Use Twelve Data /price endpoint to get latest price for XAU/USD (e.g. "XAU/USD").
-    Endpoint: https://api.twelvedata.com/price?symbol=XAU/USD&apikey=...
-    """
+    """Get latest price from Twelve Data /price endpoint."""
     try:
         key = _next_td_key()
+        if not key:
+            return None
         url = "https://api.twelvedata.com/price"
         params = {"symbol": PAIR_SYMBOL, "apikey": key}
         r = requests.get(url, params=params, timeout=8)
         r.raise_for_status()
         j = r.json()
-        # expected: {"price":"1920.12"} or {"status":"error", "message":...}
         if "price" in j:
             return float(j["price"])
         else:
-            print("⚠️ TwelveData response:", j)
+            print("⚠️ TwelveData /price response:", j)
     except Exception as e:
         print("❌ fetch_price_twelvedata error:", e)
     return None
 
-def fetch_price():
-    # primary: Twelve Data
-    return fetch_price_twelvedata()
+def fetch_historical_5m(outputsize=500):
+    """Fetch historical 5-min candles from Twelve Data time_series endpoint.
+       Returns DataFrame indexed by datetime UTC.
+    """
+    try:
+        key = _next_td_key()
+        if not key:
+            return None
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": PAIR_SYMBOL,
+            "interval": f"{CANDLE_INTERVAL_MIN}min",
+            "outputsize": str(outputsize),
+            "format": "JSON",
+            "apikey": key
+        }
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        j = r.json()
+        if "values" not in j:
+            print("⚠️ TwelveData /time_series response:", j)
+            return None
+        values = j["values"]
+        # TwelveData returns newest-first; convert to DataFrame oldest-first
+        rows = []
+        for v in reversed(values):
+            # v has datetime, open, high, low, close, volume maybe
+            rows.append({
+                "datetime": pd.to_datetime(v["datetime"]),
+                "open": float(v["open"]),
+                "high": float(v["high"]),
+                "low": float(v["low"]),
+                "close": float(v["close"])
+            })
+        df = pd.DataFrame(rows).set_index("datetime").sort_index()
+        return df
+    except Exception as e:
+        print("❌ fetch_historical_5m error:", e)
+        return None
 
-# ================== CANDLE AGGREGATION ==================
-def floor_to_5min(dt):
-    return dt.replace(minute=(dt.minute // CANDLE_INTERVAL_MIN) * CANDLE_INTERVAL_MIN, second=0, microsecond=0)
+# --------------- tick aggregation (in-memory) ---------------
+tick_buckets = {}
+def floor_to_bucket(dt_utc):
+    return dt_utc.replace(minute=(dt_utc.minute // CANDLE_INTERVAL_MIN) * CANDLE_INTERVAL_MIN, second=0, microsecond=0)
 
-def add_tick(ts, price):
-    # ts expected timezone-aware (UTC)
-    ts_utc = ts.astimezone(pytz.utc)
-    bucket = floor_to_5min(ts_utc)
-    key = bucket.strftime("%Y-%m-%d %H:%M:%S")
+def add_tick(ts_utc, price):
+    key = floor_to_bucket(ts_utc)
     tick_buckets.setdefault(key, []).append(price)
+    # close buckets older than one interval and persist
     close_old_buckets()
 
 def close_old_buckets():
     now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
-    for key in list(tick_buckets.keys()):
-        bucket_dt = datetime.strptime(key, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.utc)
-        if now_utc >= bucket_dt + timedelta(minutes=CANDLE_INTERVAL_MIN):
-            prices = tick_buckets.pop(key, [])
+    keys = list(tick_buckets.keys())
+    for k in keys:
+        if now_utc >= (k + timedelta(minutes=CANDLE_INTERVAL_MIN)):
+            prices = tick_buckets.pop(k, [])
             if prices:
-                try:
-                    insert_candle(bucket_dt, prices[0], max(prices), min(prices), prices[-1])
-                except Exception as e:
-                    print("❌ Error inserting aggregated candle:", e)
+                o, h, l, c = prices[0], max(prices), min(prices), prices[-1]
+                # append to CSV / DataFrame
+                df = load_candles_df()
+                arr = {"datetime": [k], "open":[o], "high":[h], "low":[l], "close":[c]}
+                new = pd.DataFrame(arr).set_index("datetime")
+                if df is None:
+                    df = new
+                else:
+                    df = pd.concat([df, new])
+                    df = df[~df.index.duplicated(keep="last")]
+                save_candles_df(df)
+                print(f"🕯️ Closed bucket {k} O:{o} H:{h} L:{l} C:{c}")
 
-# ================== INDICATOR ANALYSIS ==================
+# --------------- indicators & signal logic ---------------
 def prepare_df(df):
     if df is None or len(df) < 30:
         return None
@@ -160,23 +188,22 @@ def detect_patterns(df):
     patterns = []
     if df is None or len(df) < 2:
         return patterns
-    last, prev = df.iloc[-1], df.iloc[-2]
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
     body = abs(last["close"] - last["open"])
     rng = last["high"] - last["low"]
     if rng > 0 and body <= 0.1 * rng:
-        patterns.append("➕ Doji")
+        patterns.append("Doji")
     if body > 0 and (last["low"] < prev["low"]) and (last["close"] > last["open"]):
-        patterns.append("📈 Bullish candle")
+        patterns.append("Bullish candle")
     if body > 0 and (last["high"] > prev["high"]) and (last["close"] < last["open"]):
-        patterns.append("📉 Bearish candle")
+        patterns.append("Bearish candle")
     return patterns
 
 def generate_signal(df):
     try:
         if df is None or len(df) < 30:
             return None, None, None, None
-
-        # compute indicators on full series
         rsi = RSIIndicator(df["close"], 14).rsi()
         ema9 = EMAIndicator(df["close"], 9).ema_indicator()
         ema20 = EMAIndicator(df["close"], 20).ema_indicator()
@@ -184,17 +211,14 @@ def generate_signal(df):
         macd = macd_calc.macd()
         macd_sig = macd_calc.macd_signal()
 
-        # copy and attach indicator values aligned to index
         df_work = df.copy()
-        df_work.loc[:, "rsi"] = rsi
-        df_work.loc[:, "ema9"] = ema9
-        df_work.loc[:, "ema20"] = ema20
-        df_work.loc[:, "macd"] = macd
-        df_work.loc[:, "macdsig"] = macd_sig
-
+        df_work["rsi"] = rsi
+        df_work["ema9"] = ema9
+        df_work["ema20"] = ema20
+        df_work["macd"] = macd
+        df_work["macdsig"] = macd_sig
         df_work = df_work.dropna()
         if df_work.empty or len(df_work) < 2:
-            print("⚠️ generate_signal: not enough valid rows after indicators")
             return None, None, None, None
 
         last = df_work.iloc[-1]
@@ -211,8 +235,7 @@ def generate_signal(df):
             score += 1; notes.append("Close > EMA20 (trend naik)")
         if last["macd"] > last["macdsig"]:
             score += 1; notes.append("MACD bullish crossover")
-
-        # stochastic & atr from full df
+        # stochastic & atr
         try:
             stoch = StochasticOscillator(df["high"], df["low"], df["close"], window=14, smooth_window=3)
             k_val = float(stoch.stoch().iloc[-1])
@@ -223,7 +246,6 @@ def generate_signal(df):
             atr = float(AverageTrueRange(df["high"], df["low"], df["close"], 14).average_true_range().iloc[-1])
         except Exception:
             atr = float("nan")
-
         indicators = {
             "rsi": float(last["rsi"]),
             "ema9": float(last["ema9"]),
@@ -240,12 +262,11 @@ def generate_signal(df):
         print("❌ generate_signal error:", e)
         return None, None, None, None
 
-# ================== MESSAGE BUILDER ==================
 def build_message(arah, price, tp1, tp2, sl, status, indicators, patterns, score, notes):
     now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
     pat = ", ".join(patterns) if patterns else "-"
-    macd_state = "bullish" if indicators['macd'] > indicators['macdsig'] else 'bearish'
-    trend_state = 'up' if price > indicators['ema20'] else 'down'
+    macd_state = "bullish" if indicators["macd"] > indicators["macdsig"] else "bearish"
+    trend_state = "up" if price > indicators["ema20"] else "down"
     reason_text = notes if notes else "-"
     msg = (
         f"📡 Sinyal XAU/USD\n"
@@ -260,57 +281,65 @@ def build_message(arah, price, tp1, tp2, sl, status, indicators, patterns, score
         f"- RSI: {indicators['rsi']:.2f}\n"
         f"- MACD: {macd_state}\n"
         f"- Trend (vs EMA20): {trend_state}\n"
-        f"- ATR: {indicators['atr']:.4f}\n"
+        f"- ATR: {indicators['atr']:.6f}\n"
         f"- Pattern: {pat}\n\n"
         f"HARAP GUNAKAN MONEY MANAGEMENT , JANGAN FULL MARGIN\n"
         f"(KETIKA MENGIKUTI SIGNAL HARAP SS DAN TINGGALKAN DI KOMENTAR)"
     )
     return msg
 
-# ================== WORK-HOURS CHECK ==================
+# --------------- working hours ---------------
 def is_working_time(now_jkt: datetime):
-    # Mon-Fri (weekday 0..4), hours 07..21 inclusive
-    weekday_ok = now_jkt.weekday() <= 4
-    hour_ok = 7 <= now_jkt.hour <= 21
-    return weekday_ok and hour_ok
+    # Mon-Fri (0..4), hours 07..21 inclusive
+    wd_ok = now_jkt.weekday() <= 4
+    hr_ok = 7 <= now_jkt.hour <= 21
+    return wd_ok and hr_ok
 
-# ================== SIGNAL TASK ==================
+# --------------- send signal ---------------
+last_signal_time = None
+
 async def send_signal(app_bot, force=False):
-    """
-    force=True akan mengirim tanpa cek jam kerja (dipakai untuk immediate-on-deploy
-    jika kamu ingin override). Secara default kita hanya kirim selama jam kerja.
-    """
     global last_signal_time
-    df = get_last_n_candles(200)
+    df = load_candles_df()
+    # if we don't have enough candles, try to fetch historical
+    if df is None or len(df) < 60:
+        fetched = fetch_historical_5m(outputsize=500)
+        if fetched is not None:
+            df = fetched
+            save_candles_df(df)
+            print("✅ Loaded historical candles from Twelve Data")
     df = prepare_df(df)
-    if df is None:
-        print("⚠️ Not enough candle data for analysis.")
-        return
-
     now = datetime.now(JKT)
-    # hindari duplikat dengan jangka waktu 50 menit
     if last_signal_time and (now - last_signal_time) < timedelta(minutes=50):
-        print("⏸️ Signal recently sent, skipping.")
+        print("⏸️ Signal recently sent; skipping.")
         return
-
-    # respect working hours unless forced
     if not force and not is_working_time(now):
-        print(f"⏱️ Now {now.strftime('%Y-%m-%d %H:%M:%S')} WIB outside working hours, skipping send.")
+        print(f"⏱️ Outside working hours ({now.strftime('%Y-%m-%d %H:%M:%S')} WIB). Skipping.")
         return
-
     arah, score, notes, indicators = generate_signal(df)
     if arah is None:
-        print("⚠️ generate_signal returned None.")
+        # fallback: create minimal message from realtime price
+        price = fetch_price_twelvedata() or float("nan")
+        msg = (
+            f"📡 Sinyal XAU/USD\n"
+            f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
+            f"⚠️ Tidak cukup data historis untuk analisis teknikal. Harga realtime: {price}\n\n"
+            f"HARAP GUNAKAN MONEY MANAGEMENT , JANGAN FULL MARGIN\n"
+            f"(KETIKA MENGIKUTI SIGNAL HARAP SS DAN TINGGALKAN DI KOMENTAR)"
+        )
+        try:
+            await app_bot.bot.send_message(chat_id=CHAT_ID, text=msg)
+            last_signal_time = datetime.now(JKT)
+            print("✅ Fallback minimal signal sent.")
+        except Exception as e:
+            print("❌ send_signal fallback error:", e)
         return
-
     patterns = detect_patterns(df)
     price = indicators["last_close"]
-
     if arah == "BUY":
         tp1, tp2, sl = round(price + 2.0, 2), round(price + 4.0, 2), round(price - 1.2, 2)
     else:
         tp1, tp2, sl = round(price - 2.0, 2), round(price - 4.0, 2), round(price + 1.2, 2)
-
     status = "🟢 KUAT" if score >= 3 else ("🟡 SEDANG" if score == 2 else "🔴 LEMAH")
     msg = build_message(arah, price, tp1, tp2, sl, status, indicators, patterns, score, notes)
     try:
@@ -320,74 +349,62 @@ async def send_signal(app_bot, force=False):
     except Exception as e:
         print("❌ send_signal error:", e)
 
-# ================== LOOP TASKS ==================
+# --------------- background tasks ---------------
 async def ticker_task():
     while True:
-        price = fetch_price()
+        price = fetch_price_twelvedata()
         if price:
-            now = datetime.utcnow().replace(tzinfo=pytz.utc)
-            add_tick(now, price)
-            print(f"tick {now.strftime('%H:%M:%S')} price={price}")
+            now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+            add_tick(now_utc, price)
+            print(f"tick {now_utc.strftime('%Y-%m-%d %H:%M:%S')} price={price}")
         await asyncio.sleep(TICK_INTERVAL_SECONDS)
 
 async def schedule_task(app_bot):
-    """
-    Mengirim setiap jam di menit 00 (00:00, 01:00, ...), namun hanya selama
-    Senin-Jumat jam 07:00-21:00 WIB. Juga pastikan saat pertama kali deploy,
-    jika saat deploy berada di jam kerja, bot mengirim signal segera.
-    """
-    # kirim segera sekali saat start jika saat itu jam kerja
+    # immediate send if within working hours
     now_jkt = datetime.now(JKT)
     if is_working_time(now_jkt):
         print("🚀 First-run during working hours: sending immediate signal.")
         await send_signal(app_bot, force=False)
     else:
         print("⏸ First-run not in working hours: immediate signal skipped.")
-
     while True:
         now = datetime.now(JKT)
-        # compute next top-of-hour at minute 00
         next_run = now.replace(minute=0, second=0, microsecond=0)
         if now >= next_run:
             next_run = next_run + timedelta(hours=1)
         wait = (next_run - now).total_seconds()
-        print(f"⏱️ Next scheduled signal at {next_run.strftime('%Y-%m-%d %H:%M:%S')} WIB (in {int(wait)}s)")
+        print(f"⏱ Next scheduled signal at {next_run.strftime('%Y-%m-%d %H:%M:%S')} WIB (in {int(wait)}s)")
         await asyncio.sleep(wait)
-        # at top of hour now, check if within working hours and weekday
         now_exec = datetime.now(JKT)
         if is_working_time(now_exec):
             await send_signal(app_bot)
         else:
             print(f"⏱️ {now_exec.strftime('%Y-%m-%d %H:%M:%S')} WIB outside working hours, not sending.")
 
-# ================== BOT HANDLERS ==================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id == AUTHORIZED_USER_ID:
+# --------------- telegram handlers ---------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user and user.id == AUTHORIZED_USER_ID:
         await update.message.reply_text("✅ Bot aktif dan siap mengirim sinyal otomatis.")
     else:
         await update.message.reply_text("👋 Halo.")
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return  # ignore unknown commands
+    return
 
-# ================== RUN BOT (main thread) ==================
+# --------------- run bot ---------------
 async def main_bot():
     app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
-    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(CommandHandler("start", start_cmd))
     app_bot.add_handler(MessageHandler(filters.COMMAND, unknown))
-
-    # start background tasks inside the bot loop
+    # background tasks
     asyncio.create_task(ticker_task())
     asyncio.create_task(schedule_task(app_bot))
-
     print("🤖 Telegram bot starting (polling)...")
     await app_bot.run_polling()
 
 if __name__ == "__main__":
-    # start flask keep-alive in background thread
     keep_alive()
-
-    # run bot and asyncio tasks in main thread event loop
     try:
         asyncio.run(main_bot())
     except (KeyboardInterrupt, SystemExit):
