@@ -4,11 +4,12 @@ asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())  # untuk Python 
 from flask import Flask
 from threading import Thread
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 import pytz
 import sqlite3
 import os
 import pandas as pd
+import random
 
 from telegram import Update
 from telegram.ext import (
@@ -21,15 +22,23 @@ from ta.volatility import AverageTrueRange
 
 # ================== CONFIG ==================
 BOT_TOKEN = "8114552558:AAFpnQEYHYa8P43g5rjOwPs5TSbjtYh9zS4"
-CHAT_ID = "-1002903040446"  # ID channel
+CHAT_ID = "-1003142698012"  # ID channel
 AUTHORIZED_USER_ID = 1305881282  # hanya kamu
 
 DATA_DIR = "data"
 DB_PATH = os.path.join(DATA_DIR, "xauusd_m5.db")
-PAIR_SYMBOL = "XAUUSD"
+PAIR_SYMBOL = "XAU/USD"  # Twelve Data expects "XAU/USD"
 TICK_INTERVAL_SECONDS = 60
 CANDLE_INTERVAL_MIN = 5
 JKT = pytz.timezone("Asia/Jakarta")
+
+# Twelve Data API keys (rotasi)
+TD_API_KEYS = [
+    "21a0860958e641cc934bec6277415088",
+    "af23649e02da42aab3e78cf343513325",
+    "94a7d766d73f4db4a7ddf877473711c7"
+]
+_td_key_index = 0
 
 tick_buckets = {}
 last_signal_time = None  # anti duplikat signal
@@ -85,29 +94,37 @@ def get_last_n_candles(n=200):
         df[c] = df[c].astype(float)
     return df
 
-# ================== PRICE SOURCE (FreeForexAPI) ==================
-def fetch_price_freeforex():
+# ================== PRICE SOURCE (Twelve Data) ==================
+def _next_td_key():
+    global _td_key_index
+    # simple round-robin or randomize to spread load
+    _td_key_index = (_td_key_index + 1) % len(TD_API_KEYS)
+    return TD_API_KEYS[_td_key_index]
+
+def fetch_price_twelvedata():
     """
-    FreeForexAPI returns JSON like: {"rates": {"XAUUSD": {"rate": 1920.12}}}
-    Note: freeforexapi might have downtime; that's why we keep robust error handling.
+    Use Twelve Data /price endpoint to get latest price for XAU/USD (e.g. "XAU/USD").
+    Endpoint: https://api.twelvedata.com/price?symbol=XAU/USD&apikey=...
     """
     try:
-        url = f"https://www.freeforexapi.com/api/live?pairs={PAIR_SYMBOL}"
-        r = requests.get(url, timeout=8)
+        key = _next_td_key()
+        url = "https://api.twelvedata.com/price"
+        params = {"symbol": PAIR_SYMBOL, "apikey": key}
+        r = requests.get(url, params=params, timeout=8)
         r.raise_for_status()
         j = r.json()
-        if "rates" in j and PAIR_SYMBOL in j["rates"]:
-            rate = j["rates"][PAIR_SYMBOL].get("rate") if isinstance(j["rates"][PAIR_SYMBOL], dict) else j["rates"][PAIR_SYMBOL]
-            if rate:
-                return float(rate)
+        # expected: {"price":"1920.12"} or {"status":"error", "message":...}
+        if "price" in j:
+            return float(j["price"])
+        else:
+            print("⚠️ TwelveData response:", j)
     except Exception as e:
-        print("❌ fetch_price_freeforex error:", e)
+        print("❌ fetch_price_twelvedata error:", e)
     return None
 
 def fetch_price():
-    # primary (FreeForex) - can add more sources here later
-    price = fetch_price_freeforex()
-    return price
+    # primary: Twelve Data
+    return fetch_price_twelvedata()
 
 # ================== CANDLE AGGREGATION ==================
 def floor_to_5min(dt):
@@ -187,13 +204,13 @@ def generate_signal(df):
         score = 0
         notes = []
         if last["rsi"] < 30 and last["close"] > last["ema9"]:
-            score += 1; notes.append("RSI oversold + >EMA9")
+            score += 1; notes.append("RSI oversold + close > EMA9")
         if last["close"] > prev["close"]:
             score += 1; notes.append("Harga naik vs candle sebelumnya")
         if last["close"] > last["ema20"]:
-            score += 1; notes.append(">EMA20 (trend naik)")
+            score += 1; notes.append("Close > EMA20 (trend naik)")
         if last["macd"] > last["macdsig"]:
-            score += 1; notes.append("MACD bullish")
+            score += 1; notes.append("MACD bullish crossover")
 
         # stochastic & atr from full df
         try:
@@ -224,27 +241,45 @@ def generate_signal(df):
         return None, None, None, None
 
 # ================== MESSAGE BUILDER ==================
-def build_message(arah, price, tp1, tp2, sl, status, indicators, patterns):
-    now = datetime.now(JKT).strftime("%H:%M:%S")
+def build_message(arah, price, tp1, tp2, sl, status, indicators, patterns, score, notes):
+    now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
     pat = ", ".join(patterns) if patterns else "-"
+    macd_state = "bullish" if indicators['macd'] > indicators['macdsig'] else 'bearish'
+    trend_state = 'up' if price > indicators['ema20'] else 'down'
+    reason_text = notes if notes else "-"
     msg = (
         f"📡 Sinyal XAU/USD\n"
         f"🕒 {now} WIB\n"
         f"📈 Arah: {arah}\n"
-        f"💰 Harga: {price}\n"
+        f"💰 Harga (realtime): {price}\n"
         f"🎯 TP1: {tp1} | TP2: {tp2}\n"
         f"🛑 SL: {sl}\n"
         f"📊 Status: {status}\n\n"
-        f"📊 RSI: {indicators['rsi']:.2f}\n"
-        f"📈 MACD: {'bullish' if indicators['macd']>indicators['macdsig'] else 'bearish'}\n"
-        f"📉 Trend: {'up' if price>indicators['ema20'] else 'down'}\n"
-        f"📊 ATR: {indicators['atr']:.2f}\n"
-        f"🕯️ Pattern: {pat}"
+        f"🔎 Reason (score {score}):\n{reason_text}\n\n"
+        f"📊 Indikator:\n"
+        f"- RSI: {indicators['rsi']:.2f}\n"
+        f"- MACD: {macd_state}\n"
+        f"- Trend (vs EMA20): {trend_state}\n"
+        f"- ATR: {indicators['atr']:.4f}\n"
+        f"- Pattern: {pat}\n\n"
+        f"HARAP GUNAKAN MONEY MANAGEMENT , JANGAN FULL MARGIN\n"
+        f"(KETIKA MENGIKUTI SIGNAL HARAP SS DAN TINGGALKAN DI KOMENTAR)"
     )
     return msg
 
+# ================== WORK-HOURS CHECK ==================
+def is_working_time(now_jkt: datetime):
+    # Mon-Fri (weekday 0..4), hours 07..21 inclusive
+    weekday_ok = now_jkt.weekday() <= 4
+    hour_ok = 7 <= now_jkt.hour <= 21
+    return weekday_ok and hour_ok
+
 # ================== SIGNAL TASK ==================
-async def send_signal(app_bot):
+async def send_signal(app_bot, force=False):
+    """
+    force=True akan mengirim tanpa cek jam kerja (dipakai untuk immediate-on-deploy
+    jika kamu ingin override). Secara default kita hanya kirim selama jam kerja.
+    """
     global last_signal_time
     df = get_last_n_candles(200)
     df = prepare_df(df)
@@ -256,6 +291,11 @@ async def send_signal(app_bot):
     # hindari duplikat dengan jangka waktu 50 menit
     if last_signal_time and (now - last_signal_time) < timedelta(minutes=50):
         print("⏸️ Signal recently sent, skipping.")
+        return
+
+    # respect working hours unless forced
+    if not force and not is_working_time(now):
+        print(f"⏱️ Now {now.strftime('%Y-%m-%d %H:%M:%S')} WIB outside working hours, skipping send.")
         return
 
     arah, score, notes, indicators = generate_signal(df)
@@ -272,10 +312,7 @@ async def send_signal(app_bot):
         tp1, tp2, sl = round(price - 2.0, 2), round(price - 4.0, 2), round(price + 1.2, 2)
 
     status = "🟢 KUAT" if score >= 3 else ("🟡 SEDANG" if score == 2 else "🔴 LEMAH")
-    msg = build_message(arah, price, tp1, tp2, sl, status, indicators, patterns)
-    if notes:
-        msg += f"\n\n📝 Note:\n{notes}"
-
+    msg = build_message(arah, price, tp1, tp2, sl, status, indicators, patterns, score, notes)
     try:
         await app_bot.bot.send_message(chat_id=CHAT_ID, text=msg)
         last_signal_time = datetime.now(JKT)
@@ -294,16 +331,34 @@ async def ticker_task():
         await asyncio.sleep(TICK_INTERVAL_SECONDS)
 
 async def schedule_task(app_bot):
-    # kirim setiap jam di menit 00 (00:00, 01:00, 02:00, ...)
+    """
+    Mengirim setiap jam di menit 00 (00:00, 01:00, ...), namun hanya selama
+    Senin-Jumat jam 07:00-21:00 WIB. Juga pastikan saat pertama kali deploy,
+    jika saat deploy berada di jam kerja, bot mengirim signal segera.
+    """
+    # kirim segera sekali saat start jika saat itu jam kerja
+    now_jkt = datetime.now(JKT)
+    if is_working_time(now_jkt):
+        print("🚀 First-run during working hours: sending immediate signal.")
+        await send_signal(app_bot, force=False)
+    else:
+        print("⏸ First-run not in working hours: immediate signal skipped.")
+
     while True:
         now = datetime.now(JKT)
+        # compute next top-of-hour at minute 00
         next_run = now.replace(minute=0, second=0, microsecond=0)
         if now >= next_run:
             next_run = next_run + timedelta(hours=1)
         wait = (next_run - now).total_seconds()
         print(f"⏱️ Next scheduled signal at {next_run.strftime('%Y-%m-%d %H:%M:%S')} WIB (in {int(wait)}s)")
         await asyncio.sleep(wait)
-        await send_signal(app_bot)
+        # at top of hour now, check if within working hours and weekday
+        now_exec = datetime.now(JKT)
+        if is_working_time(now_exec):
+            await send_signal(app_bot)
+        else:
+            print(f"⏱️ {now_exec.strftime('%Y-%m-%d %H:%M:%S')} WIB outside working hours, not sending.")
 
 # ================== BOT HANDLERS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -337,4 +392,3 @@ if __name__ == "__main__":
         asyncio.run(main_bot())
     except (KeyboardInterrupt, SystemExit):
         print("Shutdown requested, exiting...")
-
