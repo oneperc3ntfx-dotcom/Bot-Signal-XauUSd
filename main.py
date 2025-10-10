@@ -382,10 +382,15 @@ def main():
     app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
     app_bot.add_handler(CommandHandler("start", start_cmd))
     app_bot.add_handler(MessageHandler(filters.COMMAND, unknown))
-    asyncio.create_task(ticker_task())
-    asyncio.create_task(schedule_task(app_bot))
+
+    async def start_background_tasks(app_bot):
+        asyncio.create_task(ticker_task())
+        asyncio.create_task(schedule_task(app_bot))
+
+    app_bot.post_init = start_background_tasks
+
     print("🤖 Telegram bot starting (polling)...")
-    app_bot.run_polling()  # ⚡ run_polling manages event loop itself
+    app_bot.run_polling()
 
 if __name__ == "__main__":
     main()
