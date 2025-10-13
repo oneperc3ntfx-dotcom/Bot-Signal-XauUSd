@@ -68,7 +68,7 @@ def load_candles_df():
         return None
 
 # ====================
-# Ambil 12 candle terakhir dari Finnhub
+# Ambil 12 candle terakhir dari Finnhub (historical)
 # ====================
 def fetch_last_candles():
     url = f"https://finnhub.io/api/v1/forex/candle?symbol={PAIR_SYMBOL}&resolution={CANDLE_INTERVAL_MIN}&count=12&token={FINNHUB_TOKEN}"
@@ -107,13 +107,14 @@ def close_old_buckets():
     keys = list(tick_buckets.keys())
     for k in keys:
         if now_utc >= (k + timedelta(minutes=CANDLE_INTERVAL_MIN)):
-            prices = tick_buckets.pop(k, [])
+            prices = tick_buckets.pop(k, None)
             if prices:
                 o, h, l, c = prices[0], max(prices), min(prices), prices[-1]
                 df = load_candles_df()
                 arr = {"datetime":[k], "open":[o], "high":[h], "low":[l], "close":[c]}
                 new = pd.DataFrame(arr).set_index("datetime")
-                if df is None: df = new
+                if df is None:
+                    df = new
                 else:
                     df = pd.concat([df, new])
                     df = df[~df.index.duplicated(keep="last")]
@@ -202,72 +203,69 @@ def build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes):
     )
 
 # ====================
-# Working time
+# Working time: Mon-Fri 05:00-04:00, off 04:00-05:00
 # ====================
 def is_working_time(now_jkt):
     wd = now_jkt.weekday()
     if wd >=5: return False
     hour = now_jkt.hour
-    if 5 <= hour <= 23: return True
-    if 0 <= hour < 4: return True
-    return False  # jam 04:00-05:00 off
+    return (hour>=5) or (hour<4)
 
 # ====================
-# Send signal
+# Send Signal
 # ====================
-async def send_signal(app_bot):
-    global last_price
+last_signal_date = None
+async def send_signal(app_bot, fake=False):
+    global last_price, last_signal_date
     df = load_candles_df()
     df_for_signal = prepare_df(df)
-    if df_for_signal is None or last_price is None:
-        print("⚠️ Not enough data or last_price not available.")
-        return
+    price = last_price if last_price else 0
 
-    df_for_signal.iloc[-1, df_for_signal.columns.get_loc("close")] = last_price
-    arah,score,notes,ind = generate_signal(df_for_signal)
-    if arah is None: return
-    pat = detect_patterns(df_for_signal)
-    price = last_price
-
-    pip = 0.01
-    if arah=="BUY":
-        tp1 = round(price + 25*pip,3)
-        tp2 = round(price + 50*pip,3)
-        sl  = round(price - 15*pip,3)
+    # Fake signal saat deploy
+    if fake:
+        arah,score,notes,ind,pat,tp1,tp2,sl,status = "BUY",0,"Fake signal untuk testing",{
+            "rsi":0,"ema9":0,"ema20":0,"macd":0,"macdsig":0,"stoch_k":0,"stoch_d":0,"atr":0,"last_close":price
+        },[],price,price,price,"🔵 FAKE"
+        msg = build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes)
     else:
-        tp1 = round(price - 25*pip,3)
-        tp2 = round(price - 50*pip,3)
-        sl  = round(price + 15*pip,3)
+        if df_for_signal is None or last_price is None:
+            print("⚠️ Not enough data or last_price not available.")
+            return
+        df_for_signal.iloc[-1, df_for_signal.columns.get_loc("close")] = last_price
+        arah,score,notes,ind = generate_signal(df_for_signal)
+        if arah is None: return
+        pat = detect_patterns(df_for_signal)
+        pip = 0.01
+        if arah=="BUY":
+            tp1 = round(price + 25*pip,3)
+            tp2 = round(price + 50*pip,3)
+            sl  = round(price - 15*pip,3)
+        else:
+            tp1 = round(price - 25*pip,3)
+            tp2 = round(price - 50*pip,3)
+            sl  = round(price + 15*pip,3)
+        status = "🟢 KUAT" if score>=3 else ("🟡 SEDANG" if score==2 else "🔴 LEMAH")
+        msg = build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes)
 
-    status = "🟢 KUAT" if score>=3 else ("🟡 SEDANG" if score==2 else "🔴 LEMAH")
-    msg = build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes)
     try:
         await app_bot.bot.send_message(chat_id=CHAT_ID, text=msg)
         print(f"✅ Signal sent at {datetime.now(JKT)}")
+        # Hapus history jika sudah jam 00
+        now = datetime.now(JKT)
+        if now.hour==0 and last_signal_date != now.date():
+            if os.path.exists(CANDLES_CSV):
+                os.remove(CANDLES_CSV)
+                print("🗑️ History candle dihapus karena jam 00")
+            last_signal_date = now.date()
     except Exception as e:
         print("❌ send_signal error:", e)
 
 # ====================
-# Fake signal saat deploy
-# ====================
-async def send_fake_signal(app_bot):
-    msg = (
-        f"📡 Sinyal XAU/USD (FAKE)\n🕒 {datetime.now(JKT).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
-        f"📈 Arah: -\n💰 Harga (realtime): -\n🎯 TP1: - | TP2: -\n🛑 SL: -\n📊 Status: -\n\n"
-        f"🔎 Reason: FAKE SIGNAL - Bot berhasil dijalankan\n"
-        f"HARAP GUNAKAN MONEY MANAGEMENT, JANGAN FULL MARGIN."
-    )
-    try:
-        await app_bot.bot.send_message(chat_id=CHAT_ID, text=msg)
-        print(f"✅ Fake signal sent at {datetime.now(JKT)}")
-    except Exception as e:
-        print("❌ send_fake_signal error:", e)
-
-# ====================
-# Scheduler
+# Scheduler untuk jam kerja
 # ====================
 async def schedule_task(app_bot):
-    await send_fake_signal(app_bot)
+    # Kirim fake signal saat deploy
+    await send_signal(app_bot, fake=True)
     while True:
         now = datetime.now(JKT)
         next_run = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
@@ -277,8 +275,6 @@ async def schedule_task(app_bot):
         now_jkt = datetime.now(JKT)
         if is_working_time(now_jkt) and last_price is not None:
             await send_signal(app_bot)
-        else:
-            print(f"⏸ Outside working hours: {now_jkt.strftime('%H:%M:%S')} WIB")
 
 # ====================
 # Finnhub WebSocket
