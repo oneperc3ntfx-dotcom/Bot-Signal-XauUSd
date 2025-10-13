@@ -71,6 +71,7 @@ def load_candles_df():
 # ====================
 tick_buckets = {}
 last_price = None
+initial_signal_sent = False
 
 def floor_to_bucket(dt_utc):
     return dt_utc.replace(minute=(dt_utc.minute // CANDLE_INTERVAL_MIN)*CANDLE_INTERVAL_MIN, second=0, microsecond=0)
@@ -92,6 +93,13 @@ def close_old_buckets():
                     df = df[~df.index.duplicated(keep="last")]
                 save_candles_df(df)
                 print(f"🕯️ Closed bucket {k} O:{o} H:{h} L:{l} C:{c}")
+
+def add_tick(ts_utc, price):
+    global last_price
+    last_price = price
+    key = floor_to_bucket(ts_utc)
+    tick_buckets.setdefault(key, []).append(price)
+    close_old_buckets()
 
 # ====================
 # Indicator & Signal Logic
@@ -203,7 +211,7 @@ async def send_signal(app_bot):
         print("❌ send_signal error:", e)
 
 # ====================
-# Finnhub WebSocket (kirim signal setiap tick)
+# Finnhub WebSocket
 # ====================
 async def finnhub_ws(app_bot):
     url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
@@ -218,7 +226,7 @@ async def finnhub_ws(app_bot):
                         for t in data["data"]:
                             price = t["p"]
                             ts = datetime.utcfromtimestamp(t["t"]/1000).replace(tzinfo=pytz.utc)
-                            add_tick(ts, price, app_bot)
+                            add_tick(ts, price)
                             await send_signal(app_bot)  # kirim sinyal setiap tick
                             print(f"tick {ts.strftime('%Y-%m-%d %H:%M:%S')} price={price}")
         except Exception as e:
