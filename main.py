@@ -10,8 +10,13 @@ import websockets
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.trend import EMAIndicator, MACD
+from ta.volatility import AverageTrueRange
 
-# === CONFIG ===
+# ====================
+# CONFIG
+# ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 AUTHORIZED_USER_ID = int(os.environ.get("AUTHORIZED_USER_ID", "0"))
@@ -20,14 +25,15 @@ PAIR_SYMBOL = "OANDA:XAU_USD"
 FLASK_PORT = int(os.environ.get("PORT", "8080"))
 DATA_DIR = os.environ.get("DATA_DIR", "data")
 CANDLES_CSV = os.path.join(DATA_DIR, "candles.csv")
-
 CANDLE_INTERVAL_MIN = 5
 JKT = pytz.timezone("Asia/Jakarta")
 
 if not BOT_TOKEN or not CHAT_ID or not FINNHUB_TOKEN:
     raise SystemExit("ERROR: BOT_TOKEN, CHAT_ID, dan FINNHUB_TOKEN harus di-set di environment")
 
-# === Keep alive (Flask) ===
+# ====================
+# Keep alive (Flask)
+# ====================
 app = Flask(__name__)
 @app.route("/")
 def home():
@@ -36,7 +42,9 @@ def home():
 def keep_alive():
     Thread(target=lambda: app.run(host="0.0.0.0", port=FLASK_PORT), daemon=True).start()
 
-# === Candle storage ===
+# ====================
+# Candle storage
+# ====================
 os.makedirs(DATA_DIR, exist_ok=True)
 
 def save_candles_df(df: pd.DataFrame):
@@ -58,19 +66,15 @@ def load_candles_df():
         print("❌ load_candles_df error:", e)
         return None
 
-# === Tick aggregation ===
+# ====================
+# Tick aggregation
+# ====================
 tick_buckets = {}
 last_price = None
+initial_signal_sent = False
 
 def floor_to_bucket(dt_utc):
     return dt_utc.replace(minute=(dt_utc.minute // CANDLE_INTERVAL_MIN)*CANDLE_INTERVAL_MIN, second=0, microsecond=0)
-
-def add_tick(ts_utc, price):
-    global last_price
-    last_price = price
-    key = floor_to_bucket(ts_utc)
-    tick_buckets.setdefault(key, []).append(price)
-    close_old_buckets()
 
 def close_old_buckets():
     now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
@@ -90,11 +94,21 @@ def close_old_buckets():
                 save_candles_df(df)
                 print(f"🕯️ Closed bucket {k} O:{o} H:{h} L:{l} C:{c}")
 
-# === Indicator & Signal Logic ===
-from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.trend import EMAIndicator, MACD
-from ta.volatility import AverageTrueRange
+def add_tick(ts_utc, price, app_bot=None):
+    global last_price, initial_signal_sent
+    last_price = price
+    key = floor_to_bucket(ts_utc)
+    tick_buckets.setdefault(key, []).append(price)
+    close_old_buckets()
 
+    # Kirim sinyal awal setelah tick pertama
+    if not initial_signal_sent and app_bot:
+        asyncio.create_task(send_signal(app_bot))
+        initial_signal_sent = True
+
+# ====================
+# Indicator & Signal Logic
+# ====================
 def prepare_df(df):
     if df is None or len(df) < 12:  # pakai 12 candle terakhir
         return None
@@ -166,24 +180,23 @@ def build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes):
         f"HARAP GUNAKAN MONEY MANAGEMENT, JANGAN FULL MARGIN."
     )
 
-# === Working time Mon-Fri 06:00-04:00 next day ===
 def is_working_time(now_jkt):
     wd = now_jkt.weekday()
     if wd >=5: return False
     hour = now_jkt.hour
     return (hour>=6) or (hour<4)
 
-# === Send Signal ===
-last_signal_time = None
+# ====================
+# Send Signal
+# ====================
 async def send_signal(app_bot):
-    global last_signal_time
+    global last_price
     df = load_candles_df()
     df_for_signal = prepare_df(df)
     if df_for_signal is None or last_price is None:
         print("⚠️ Not enough data or last_price not available.")
         return
 
-    # Gunakan harga realtime terakhir
     df_for_signal.iloc[-1, df_for_signal.columns.get_loc("close")] = last_price
     arah,score,notes,ind = generate_signal(df_for_signal)
     if arah is None: return
@@ -204,16 +217,14 @@ async def send_signal(app_bot):
     msg = build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes)
     try:
         await app_bot.bot.send_message(chat_id=CHAT_ID, text=msg)
-        last_signal_time = datetime.now(JKT)
-        print(f"✅ Signal sent at {last_signal_time}")
+        print(f"✅ Signal sent at {datetime.now(JKT)}")
     except Exception as e:
         print("❌ send_signal error:", e)
 
-# === Scheduler ===
+# ====================
+# Scheduler
+# ====================
 async def schedule_task(app_bot):
-    print("🚀 Sending initial signal on deploy...")
-    await send_signal(app_bot)  # kirim signal pertama saat deploy
-
     while True:
         now = datetime.now(JKT)
         next_run = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
@@ -228,8 +239,10 @@ async def schedule_task(app_bot):
 
         await send_signal(app_bot)
 
-# === Finnhub WebSocket ===
-async def finnhub_ws():
+# ====================
+# Finnhub WebSocket
+# ====================
+async def finnhub_ws(app_bot):
     url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
     while True:
         try:
@@ -243,14 +256,15 @@ async def finnhub_ws():
                         for t in data["data"]:
                             price = t["p"]
                             ts = datetime.utcfromtimestamp(t["t"]/1000).replace(tzinfo=pytz.utc)
-                            add_tick(ts, price)
-                            # Simpan last_price
+                            add_tick(ts, price, app_bot)
                             print(f"tick {ts.strftime('%Y-%m-%d %H:%M:%S')} price={price}")
         except Exception as e:
             print("⚠️ WebSocket error:", e)
             await asyncio.sleep(5)
 
-# === Telegram Handlers ===
+# ====================
+# Telegram Handlers
+# ====================
 async def start_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if u and u.id == AUTHORIZED_USER_ID:
@@ -278,7 +292,9 @@ async def harga_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
         now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
         await update.message.reply_text(f"💰 Harga realtime XAU/USD: {last_price:.3f}\n🕒 {now} WIB")
 
-# === Main ===
+# ====================
+# Main
+# ====================
 def main():
     keep_alive()
     app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -288,7 +304,7 @@ def main():
     app_bot.add_handler(MessageHandler(filters.COMMAND, lambda u,c:None))
 
     async def start_tasks(app_bot):
-        asyncio.create_task(finnhub_ws())
+        asyncio.create_task(finnhub_ws(app_bot))
         asyncio.create_task(schedule_task(app_bot))
 
     app_bot.post_init = start_tasks
