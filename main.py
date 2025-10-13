@@ -68,7 +68,7 @@ def load_candles_df():
         return None
 
 # ====================
-# Ambil 12 candle terakhir dari Finnhub (historical)
+# Ambil 12 candle terakhir dari Finnhub
 # ====================
 def fetch_last_candles():
     url = f"https://finnhub.io/api/v1/forex/candle?symbol={PAIR_SYMBOL}&resolution={CANDLE_INTERVAL_MIN}&count=12&token={FINNHUB_TOKEN}"
@@ -202,7 +202,18 @@ def build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes):
     )
 
 # ====================
-# Send Signal
+# Working time
+# ====================
+def is_working_time(now_jkt):
+    wd = now_jkt.weekday()
+    if wd >=5: return False
+    hour = now_jkt.hour
+    if 5 <= hour <= 23: return True
+    if 0 <= hour < 4: return True
+    return False  # jam 04:00-05:00 off
+
+# ====================
+# Send signal
 # ====================
 async def send_signal(app_bot):
     global last_price
@@ -212,7 +223,6 @@ async def send_signal(app_bot):
         print("⚠️ Not enough data or last_price not available.")
         return
 
-    # Gunakan harga realtime terakhir
     df_for_signal.iloc[-1, df_for_signal.columns.get_loc("close")] = last_price
     arah,score,notes,ind = generate_signal(df_for_signal)
     if arah is None: return
@@ -238,6 +248,39 @@ async def send_signal(app_bot):
         print("❌ send_signal error:", e)
 
 # ====================
+# Fake signal saat deploy
+# ====================
+async def send_fake_signal(app_bot):
+    msg = (
+        f"📡 Sinyal XAU/USD (FAKE)\n🕒 {datetime.now(JKT).strftime('%Y-%m-%d %H:%M:%S')} WIB\n"
+        f"📈 Arah: -\n💰 Harga (realtime): -\n🎯 TP1: - | TP2: -\n🛑 SL: -\n📊 Status: -\n\n"
+        f"🔎 Reason: FAKE SIGNAL - Bot berhasil dijalankan\n"
+        f"HARAP GUNAKAN MONEY MANAGEMENT, JANGAN FULL MARGIN."
+    )
+    try:
+        await app_bot.bot.send_message(chat_id=CHAT_ID, text=msg)
+        print(f"✅ Fake signal sent at {datetime.now(JKT)}")
+    except Exception as e:
+        print("❌ send_fake_signal error:", e)
+
+# ====================
+# Scheduler
+# ====================
+async def schedule_task(app_bot):
+    await send_fake_signal(app_bot)
+    while True:
+        now = datetime.now(JKT)
+        next_run = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        wait = (next_run - now).total_seconds()
+        print(f"⏱ Next scheduled signal at {next_run.strftime('%Y-%m-%d %H:%M:%S')} WIB (in {int(wait)}s)")
+        await asyncio.sleep(wait)
+        now_jkt = datetime.now(JKT)
+        if is_working_time(now_jkt) and last_price is not None:
+            await send_signal(app_bot)
+        else:
+            print(f"⏸ Outside working hours: {now_jkt.strftime('%H:%M:%S')} WIB")
+
+# ====================
 # Finnhub WebSocket
 # ====================
 async def finnhub_ws(app_bot):
@@ -254,7 +297,8 @@ async def finnhub_ws(app_bot):
                             price = t["p"]
                             ts = datetime.utcfromtimestamp(t["t"]/1000).replace(tzinfo=pytz.utc)
                             add_tick(ts, price)
-                            await send_signal(app_bot)
+                            if is_working_time(datetime.now(JKT)):
+                                await send_signal(app_bot)
                             print(f"tick {ts.strftime('%Y-%m-%d %H:%M:%S')} price={price}")
         except Exception as e:
             print("⚠️ WebSocket error:", e)
@@ -295,9 +339,7 @@ async def harga_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
 # ====================
 def main():
     keep_alive()
-    # Load historical candles
     fetch_last_candles()
-    # Telegram bot
     app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
     app_bot.add_handler(CommandHandler("start", start_cmd))
     app_bot.add_handler(CommandHandler("signal", signal_cmd))
@@ -306,8 +348,7 @@ def main():
 
     async def start_tasks(app_bot):
         asyncio.create_task(finnhub_ws(app_bot))
-        # Kirim signal pertama langsung setelah load historical
-        await send_signal(app_bot)
+        asyncio.create_task(schedule_task(app_bot))
 
     app_bot.post_init = start_tasks
     print("🤖 Telegram bot starting (polling)...")
