@@ -71,7 +71,6 @@ def load_candles_df():
 # ====================
 tick_buckets = {}
 last_price = None
-initial_signal_sent = False
 
 def floor_to_bucket(dt_utc):
     return dt_utc.replace(minute=(dt_utc.minute // CANDLE_INTERVAL_MIN)*CANDLE_INTERVAL_MIN, second=0, microsecond=0)
@@ -94,23 +93,11 @@ def close_old_buckets():
                 save_candles_df(df)
                 print(f"🕯️ Closed bucket {k} O:{o} H:{h} L:{l} C:{c}")
 
-def add_tick(ts_utc, price, app_bot=None):
-    global last_price, initial_signal_sent
-    last_price = price
-    key = floor_to_bucket(ts_utc)
-    tick_buckets.setdefault(key, []).append(price)
-    close_old_buckets()
-
-    # Kirim sinyal awal setelah tick pertama
-    if not initial_signal_sent and app_bot:
-        asyncio.create_task(send_signal(app_bot))
-        initial_signal_sent = True
-
 # ====================
 # Indicator & Signal Logic
 # ====================
 def prepare_df(df):
-    if df is None or len(df) < 12:  # pakai 12 candle terakhir
+    if df is None or len(df) < 12:
         return None
     return df.tail(12)
 
@@ -180,12 +167,6 @@ def build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes):
         f"HARAP GUNAKAN MONEY MANAGEMENT, JANGAN FULL MARGIN."
     )
 
-def is_working_time(now_jkt):
-    wd = now_jkt.weekday()
-    if wd >=5: return False
-    hour = now_jkt.hour
-    return (hour>=6) or (hour<4)
-
 # ====================
 # Send Signal
 # ====================
@@ -222,33 +203,14 @@ async def send_signal(app_bot):
         print("❌ send_signal error:", e)
 
 # ====================
-# Scheduler
-# ====================
-async def schedule_task(app_bot):
-    while True:
-        now = datetime.now(JKT)
-        next_run = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        wait = (next_run - now).total_seconds()
-        print(f"⏱ Next scheduled signal at {next_run.strftime('%Y-%m-%d %H:%M:%S')} WIB (in {int(wait)}s)")
-        await asyncio.sleep(wait)
-
-        now_jkt = datetime.now(JKT)
-        if not is_working_time(now_jkt):
-            print(f"⏸ Outside working hours: {now_jkt.strftime('%H:%M:%S')} WIB")
-            continue
-
-        await send_signal(app_bot)
-
-# ====================
-# Finnhub WebSocket
+# Finnhub WebSocket (kirim signal setiap tick)
 # ====================
 async def finnhub_ws(app_bot):
     url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
     while True:
         try:
             async with websockets.connect(url, ping_interval=None) as ws:
-                sub = json.dumps({"type":"subscribe","symbol":PAIR_SYMBOL})
-                await ws.send(sub)
+                await ws.send(json.dumps({"type":"subscribe","symbol":PAIR_SYMBOL}))
                 print(f"✅ Subscribed to {PAIR_SYMBOL} via Finnhub")
                 async for msg in ws:
                     data = json.loads(msg)
@@ -257,6 +219,7 @@ async def finnhub_ws(app_bot):
                             price = t["p"]
                             ts = datetime.utcfromtimestamp(t["t"]/1000).replace(tzinfo=pytz.utc)
                             add_tick(ts, price, app_bot)
+                            await send_signal(app_bot)  # kirim sinyal setiap tick
                             print(f"tick {ts.strftime('%Y-%m-%d %H:%M:%S')} price={price}")
         except Exception as e:
             print("⚠️ WebSocket error:", e)
@@ -305,7 +268,6 @@ def main():
 
     async def start_tasks(app_bot):
         asyncio.create_task(finnhub_ws(app_bot))
-        asyncio.create_task(schedule_task(app_bot))
 
     app_bot.post_init = start_tasks
     print("🤖 Telegram bot starting (polling)...")
