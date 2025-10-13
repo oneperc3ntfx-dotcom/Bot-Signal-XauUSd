@@ -15,7 +15,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Messa
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 AUTHORIZED_USER_ID = int(os.environ.get("AUTHORIZED_USER_ID", "0"))
-FINNHUB_TOKEN = os.environ.get("FINNHUB_TOKEN", "d3ih5cpr01qmn7fk333gd3ih5cpr01qmn7fk3340")
+FINNHUB_TOKEN = os.environ.get("FINNHUB_TOKEN")
 PAIR_SYMBOL = "OANDA:XAU_USD"
 FLASK_PORT = int(os.environ.get("PORT", "8080"))
 DATA_DIR = os.environ.get("DATA_DIR", "data")
@@ -24,8 +24,8 @@ CANDLES_CSV = os.path.join(DATA_DIR, "candles.csv")
 CANDLE_INTERVAL_MIN = 5
 JKT = pytz.timezone("Asia/Jakarta")
 
-if not BOT_TOKEN or not CHAT_ID:
-    raise SystemExit("ERROR: BOT_TOKEN and CHAT_ID must be set in environment")
+if not BOT_TOKEN or not CHAT_ID or not FINNHUB_TOKEN:
+    raise SystemExit("ERROR: BOT_TOKEN, CHAT_ID, dan FINNHUB_TOKEN harus di-set di environment")
 
 # === Keep alive (Flask) ===
 app = Flask(__name__)
@@ -60,7 +60,7 @@ def load_candles_df():
 
 # === Tick aggregation ===
 tick_buckets = {}
-last_price = None   # ✅ untuk simpan harga realtime terakhir
+last_price = None
 
 def floor_to_bucket(dt_utc):
     return dt_utc.replace(minute=(dt_utc.minute // CANDLE_INTERVAL_MIN)*CANDLE_INTERVAL_MIN, second=0, microsecond=0)
@@ -96,9 +96,9 @@ from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
 
 def prepare_df(df):
-    if df is None or len(df) < 30:
+    if df is None or len(df) < 12:  # pakai 12 candle terakhir
         return None
-    return df
+    return df.tail(12)
 
 def detect_patterns(df):
     pats = []
@@ -113,7 +113,6 @@ def detect_patterns(df):
 
 def generate_signal(df):
     try:
-        if df is None or len(df)<30: return None,None,None,None
         rsi = RSIIndicator(df["close"],14).rsi()
         ema9 = EMAIndicator(df["close"],9).ema_indicator()
         ema20 = EMAIndicator(df["close"],20).ema_indicator()
@@ -167,32 +166,40 @@ def build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes):
         f"HARAP GUNAKAN MONEY MANAGEMENT, JANGAN FULL MARGIN."
     )
 
-# === Working time (Mon–Fri, 06:00–04:00 next day) ===
+# === Working time Mon-Fri 06:00-04:00 next day ===
 def is_working_time(now_jkt):
     wd = now_jkt.weekday()
-    if wd >= 5:  # Sabtu/Minggu libur
-        return False
+    if wd >=5: return False
     hour = now_jkt.hour
-    # 06:00 - 23:59, atau 00:00 - 03:59
-    return (hour >= 6) or (hour < 4)
+    return (hour>=6) or (hour<4)
 
 # === Send Signal ===
 last_signal_time = None
-
 async def send_signal(app_bot):
     global last_signal_time
-    df = prepare_df(load_candles_df())
-    if df is None or len(df)<30:
-        print("⚠️ Not enough candle data.")
+    df = load_candles_df()
+    df_for_signal = prepare_df(df)
+    if df_for_signal is None or last_price is None:
+        print("⚠️ Not enough data or last_price not available.")
         return
-    arah,score,notes,ind = generate_signal(df)
+
+    # Gunakan harga realtime terakhir
+    df_for_signal.iloc[-1, df_for_signal.columns.get_loc("close")] = last_price
+    arah,score,notes,ind = generate_signal(df_for_signal)
     if arah is None: return
-    pat = detect_patterns(df)
-    price = ind["last_close"]
+    pat = detect_patterns(df_for_signal)
+    price = last_price
+
+    pip = 0.01
     if arah=="BUY":
-        tp1,tp2,sl = round(price+2.0,2), round(price+4.0,2), round(price-1.2,2)
+        tp1 = round(price + 25*pip,3)
+        tp2 = round(price + 50*pip,3)
+        sl  = round(price - 15*pip,3)
     else:
-        tp1,tp2,sl = round(price-2.0,2), round(price-4.0,2), round(price+1.2,2)
+        tp1 = round(price - 25*pip,3)
+        tp2 = round(price - 50*pip,3)
+        sl  = round(price + 15*pip,3)
+
     status = "🟢 KUAT" if score>=3 else ("🟡 SEDANG" if score==2 else "🔴 LEMAH")
     msg = build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes)
     try:
@@ -204,15 +211,14 @@ async def send_signal(app_bot):
 
 # === Scheduler ===
 async def schedule_task(app_bot):
-    await asyncio.sleep(5)
-    print("🚀 Sending initial startup signal...")
-    await send_signal(app_bot)
+    print("🚀 Sending initial signal on deploy...")
+    await send_signal(app_bot)  # kirim signal pertama saat deploy
 
     while True:
         now = datetime.now(JKT)
-        next_run = now + timedelta(minutes=5 - now.minute % 5)
+        next_run = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         wait = (next_run - now).total_seconds()
-        print(f"⏱ Next tick aggregation at {next_run.strftime('%Y-%m-%d %H:%M:%S')} WIB (in {int(wait)}s)")
+        print(f"⏱ Next scheduled signal at {next_run.strftime('%Y-%m-%d %H:%M:%S')} WIB (in {int(wait)}s)")
         await asyncio.sleep(wait)
 
         now_jkt = datetime.now(JKT)
@@ -220,13 +226,7 @@ async def schedule_task(app_bot):
             print(f"⏸ Outside working hours: {now_jkt.strftime('%H:%M:%S')} WIB")
             continue
 
-        close_old_buckets()
-
-        if now_jkt.minute == 0:
-            print(f"🚀 It's {now_jkt.strftime('%H:%M')} WIB — sending signal.")
-            await send_signal(app_bot)
-        else:
-            print("💾 Candle updated — waiting for next 00 minute.")
+        await send_signal(app_bot)
 
 # === Finnhub WebSocket ===
 async def finnhub_ws():
@@ -244,6 +244,7 @@ async def finnhub_ws():
                             price = t["p"]
                             ts = datetime.utcfromtimestamp(t["t"]/1000).replace(tzinfo=pytz.utc)
                             add_tick(ts, price)
+                            # Simpan last_price
                             print(f"tick {ts.strftime('%Y-%m-%d %H:%M:%S')} price={price}")
         except Exception as e:
             print("⚠️ WebSocket error:", e)
@@ -253,7 +254,7 @@ async def finnhub_ws():
 async def start_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if u and u.id == AUTHORIZED_USER_ID:
-        await update.message.reply_text("✅ Bot aktif. Gunakan /signal untuk kirim sinyal manual atau /harga untuk lihat harga realtime.")
+        await update.message.reply_text("✅ Bot aktif. Gunakan /signal untuk sinyal manual atau /harga untuk harga realtime.")
     else:
         await update.message.reply_text("👋 Halo.")
 
@@ -264,7 +265,7 @@ async def signal_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("📡 Mengirim sinyal manual...")
     await send_signal(context.application)
-    await update.message.reply_text("✅ Sinyal manual telah dikirim (jika data cukup).")
+    await update.message.reply_text("✅ Sinyal manual telah dikirim.")
 
 async def harga_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
