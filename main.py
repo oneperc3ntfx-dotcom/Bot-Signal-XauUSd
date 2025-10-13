@@ -13,6 +13,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Messa
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
+import requests
 
 # ====================
 # CONFIG
@@ -67,11 +68,36 @@ def load_candles_df():
         return None
 
 # ====================
-# Tick aggregation
+# Ambil 12 candle terakhir dari Finnhub (historical)
+# ====================
+def fetch_last_candles():
+    url = f"https://finnhub.io/api/v1/forex/candle?symbol={PAIR_SYMBOL}&resolution={CANDLE_INTERVAL_MIN}&count=12&token={FINNHUB_TOKEN}"
+    try:
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        if data.get("s") != "ok":
+            print("⚠️ Gagal ambil candle historis")
+            return None
+        times = [datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.utc) for ts in data["t"]]
+        df = pd.DataFrame({
+            "datetime": times,
+            "open": data["o"],
+            "high": data["h"],
+            "low": data["l"],
+            "close": data["c"]
+        }).set_index("datetime")
+        save_candles_df(df)
+        print("✅ Loaded 12 historical candles")
+        return df
+    except Exception as e:
+        print("❌ fetch_last_candles error:", e)
+        return None
+
+# ====================
+# Tick & candle update
 # ====================
 tick_buckets = {}
 last_price = None
-initial_signal_sent = False
 
 def floor_to_bucket(dt_utc):
     return dt_utc.replace(minute=(dt_utc.minute // CANDLE_INTERVAL_MIN)*CANDLE_INTERVAL_MIN, second=0, microsecond=0)
@@ -186,6 +212,7 @@ async def send_signal(app_bot):
         print("⚠️ Not enough data or last_price not available.")
         return
 
+    # Gunakan harga realtime terakhir
     df_for_signal.iloc[-1, df_for_signal.columns.get_loc("close")] = last_price
     arah,score,notes,ind = generate_signal(df_for_signal)
     if arah is None: return
@@ -227,7 +254,7 @@ async def finnhub_ws(app_bot):
                             price = t["p"]
                             ts = datetime.utcfromtimestamp(t["t"]/1000).replace(tzinfo=pytz.utc)
                             add_tick(ts, price)
-                            await send_signal(app_bot)  # kirim sinyal setiap tick
+                            await send_signal(app_bot)
                             print(f"tick {ts.strftime('%Y-%m-%d %H:%M:%S')} price={price}")
         except Exception as e:
             print("⚠️ WebSocket error:", e)
@@ -268,6 +295,9 @@ async def harga_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
 # ====================
 def main():
     keep_alive()
+    # Load historical candles
+    fetch_last_candles()
+    # Telegram bot
     app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
     app_bot.add_handler(CommandHandler("start", start_cmd))
     app_bot.add_handler(CommandHandler("signal", signal_cmd))
@@ -276,6 +306,8 @@ def main():
 
     async def start_tasks(app_bot):
         asyncio.create_task(finnhub_ws(app_bot))
+        # Kirim signal pertama langsung setelah load historical
+        await send_signal(app_bot)
 
     app_bot.post_init = start_tasks
     print("🤖 Telegram bot starting (polling)...")
