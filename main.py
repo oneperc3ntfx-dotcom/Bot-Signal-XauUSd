@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import asyncio
-import json
 from datetime import datetime, timedelta
 import pytz
 import pandas as pd
@@ -226,7 +225,7 @@ async def send_signal(app_bot,fake=False):
 # Scheduler
 # ====================
 async def schedule_task(app_bot):
-    await send_signal(app_bot,fake=True)
+    await send_signal(app_bot,fake=True)  # FAKE signal saat startup
     while True:
         now=datetime.now(JKT)
         next_run=now.replace(minute=0,second=0,microsecond=0)+timedelta(hours=1)
@@ -259,15 +258,16 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Main
 # ====================
 def main():
-    app_bot=ApplicationBuilder().token(BOT_TOKEN).build()
-    app_bot.add_handler(CommandHandler("start",start_cmd))
-    app_bot.add_handler(CommandHandler("signal",signal_cmd))
+    app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start_cmd))
+    app_bot.add_handler(CommandHandler("signal", signal_cmd))
 
+    # post_init harus coroutine
     async def start_tasks(app_bot):
         fetch_candles_td()
         asyncio.create_task(schedule_task(app_bot))
 
-    app_bot.post_init=lambda app: asyncio.create_task(start_tasks(app))
+    app_bot.post_init = start_tasks
     print("🤖 Telegram bot starting...")
     app_bot.run_polling()
 
