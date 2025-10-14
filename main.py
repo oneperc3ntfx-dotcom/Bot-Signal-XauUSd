@@ -12,8 +12,7 @@ from telegram.ext import Updater, CommandHandler, CallbackContext
 # ==========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID"))
-FINNHUB_TOKENS = os.getenv("FINNHUB_TOKEN", "").split(",")  # support multi-key, comma-separated
+AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 PAIR_SYMBOL = os.getenv("PAIR_SYMBOL", "XAU/USD")
 
 bot = Bot(token=BOT_TOKEN)
@@ -21,25 +20,26 @@ last_signal_time = None
 
 
 # ==========================
-# Fetch Realtime Price (Finnhub with rotation)
+# Fetch Realtime Price (Yahoo Finance)
 # ==========================
 def fetch_realtime_price():
-    """Ambil harga realtime dari Finnhub, otomatis rotasi API key bila gagal"""
-    symbol = f"OANDA:{PAIR_SYMBOL.replace('/', '_')}"
-    for token in FINNHUB_TOKENS:
-        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={token.strip()}"
-        try:
-            res = requests.get(url, timeout=10).json()
-            price = res.get("c", None)
-            if price:
-                return round(price, 2)
-            else:
-                print(f"⚠️ API key {token[:8]}... gagal respon valid: {res}")
-        except Exception as e:
-            print(f"⚠️ Error pada API key {token[:8]}... : {e}")
-        time.sleep(1)  # jeda 1 detik sebelum coba key berikutnya
+    """
+    Ambil harga realtime dari Yahoo Finance.
+    Contoh simbol:
+    - XAU/USD → XAUUSD=X
+    - EUR/USD → EURUSD=X
+    - GBP/USD → GBPUSD=X
+    """
+    try:
+        yahoo_symbol = f"{PAIR_SYMBOL.replace('/', '')}=X"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?interval=1m"
+        res = requests.get(url, timeout=10).json()
 
-    print("❌ Semua API Finnhub gagal diakses.")
+        price = res["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        if price:
+            return round(price, 2)
+    except Exception as e:
+        print("⚠️ Yahoo Finance error:", e)
     return None
 
 
@@ -52,11 +52,11 @@ def generate_signal():
     price = fetch_realtime_price()
 
     if not price:
-        bot.send_message(chat_id=CHAT_ID, text="⚠️ Gagal mengambil harga realtime dari semua API Finnhub.")
+        bot.send_message(chat_id=CHAT_ID, text="⚠️ Gagal mengambil harga realtime dari Yahoo Finance.")
         return
 
     direction = random.choice(["BUY", "SELL"])
-    pip_value = 0.1  # 1 pip = 0.1 untuk XAUUSD (ubah sesuai kebutuhan)
+    pip_value = 0.1  # 1 pip = 0.1 untuk XAU/USD (bisa disesuaikan)
 
     if direction == "BUY":
         tp1 = round(price + (25 * pip_value), 2)
@@ -100,7 +100,7 @@ def harga(update: Update, context: CallbackContext):
     if price:
         update.message.reply_text(f"💰 Harga {PAIR_SYMBOL} saat ini: {price}")
     else:
-        update.message.reply_text("⚠️ Gagal mengambil harga realtime dari semua API key Finnhub.")
+        update.message.reply_text("⚠️ Gagal mengambil harga realtime dari Yahoo Finance.")
 
 
 def status(update: Update, context: CallbackContext):
@@ -117,7 +117,7 @@ def manual_signal(update: Update, context: CallbackContext):
 
 
 # ==========================
-# Scheduler (Setiap Jam 00:00)
+# Scheduler (Setiap Jam 00:00 WIB)
 # ==========================
 def job():
     generate_signal()
@@ -137,7 +137,7 @@ dp.add_handler(CommandHandler("signal", manual_signal))
 # Jadwal kirim sinyal otomatis jam 00:00 WIB (17:00 UTC di Railway)
 schedule.every().day.at("17:00").do(job)
 
-print("🤖 Bot signal random aktif. Menunggu jadwal 00:00 WIB ...")
+print("🤖 Bot signal random aktif (Yahoo Finance). Menunggu jadwal 00:00 WIB ...")
 
 # Kirim sinyal awal saat bot pertama kali aktif
 try:
