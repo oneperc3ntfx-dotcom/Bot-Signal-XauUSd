@@ -53,13 +53,18 @@ def fetch_candles_td():
     start = datetime.now(JKT).replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(minutes=55)
     url = f"https://api.twelvedata.com/time_series?symbol={PAIR_SYMBOL}&interval={CANDLE_INTERVAL_MIN}min&apikey={key}&start_date={start.strftime('%Y-%m-%d %H:%M:%S')}&end_date={end.strftime('%Y-%m-%d %H:%M:%S')}&format=JSON"
-    r = requests.get(url, timeout=10).json()
+    try:
+        r = requests.get(url, timeout=10).json()
+    except Exception as e:
+        print("⚠️ Error fetch candles:", e)
+        return None
     if r.get("status") != "ok":
         print("⚠️ Failed fetch candles:", r)
         return None
-    data = r["values"]
+    data = r.get("values", [])
+    if not data:
+        return None
     df = pd.DataFrame(data)
-    df = df.rename(columns={"datetime":"datetime","open":"open","high":"high","low":"low","close":"close"})
     df["datetime"] = pd.to_datetime(df["datetime"])
     for c in ["open","high","low","close"]:
         df[c] = df[c].astype(float)
@@ -171,10 +176,13 @@ last_price=None
 
 def fetch_price_finnhub():
     global last_price
-    url=f"https://finnhub.io/api/v1/quote?symbol=OANDA:XAU_USD&token={FINNHUB_TOKEN}"
-    r=requests.get(url,timeout=5).json()
-    last_price=r.get("c",0.0)
-    last_price=float(last_price)
+    try:
+        url=f"https://finnhub.io/api/v1/quote?symbol=OANDA:XAU_USD&token={FINNHUB_TOKEN}"
+        r=requests.get(url,timeout=5).json()
+        last_price=r.get("c",0.0)
+        last_price=float(last_price)
+    except:
+        last_price=0.0
     return last_price
 
 async def send_signal(app_bot,fake=False):
@@ -190,21 +198,25 @@ async def send_signal(app_bot,fake=False):
     else:
         arah,score,notes,ind=generate_signal(df_for_signal)
         if arah is None:
-            print("⚠️ generate_signal tidak menghasilkan sinyal")
-            return
-        pat=detect_patterns(df_for_signal)
-        pip=0.01
-        if arah=="BUY":
-            tp1=round(price+25*pip,3)
-            tp2=round(price+50*pip,3)
-            sl=round(price-15*pip,3)
+            print("⚠️ generate_signal tidak menghasilkan sinyal, kirim FAKE signal")
+            msg=build_message(None,price,None,None,None,None,None,None,0,None,fake=True)
         else:
-            tp1=round(price-25*pip,3)
-            tp2=round(price-50*pip,3)
-            sl=round(price+15*pip,3)
-        status="🟢 KUAT" if score>=3 else ("🟡 SEDANG" if score==2 else "🔴 LEMAH")
-        msg=build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes,fake=False)
-    await app_bot.bot.send_message(chat_id=CHAT_ID,text=msg)
+            pat=detect_patterns(df_for_signal)
+            pip=0.01
+            if arah=="BUY":
+                tp1=round(price+25*pip,3)
+                tp2=round(price+50*pip,3)
+                sl=round(price-15*pip,3)
+            else:
+                tp1=round(price-25*pip,3)
+                tp2=round(price-50*pip,3)
+                sl=round(price+15*pip,3)
+            status="🟢 KUAT" if score>=3 else ("🟡 SEDANG" if score==2 else "🔴 LEMAH")
+            msg=build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes,fake=False)
+    try:
+        await app_bot.bot.send_message(chat_id=CHAT_ID,text=msg)
+    except Exception as e:
+        print("⚠️ Gagal mengirim sinyal:", e)
     print(f"✅ Signal sent at {datetime.now(JKT)} (fake={fake})")
     now=datetime.now(JKT)
     if now.hour==1 and last_signal_date!=now.date():
@@ -255,7 +267,7 @@ def main():
         fetch_candles_td()
         asyncio.create_task(schedule_task(app_bot))
 
-    app_bot.post_init=start_tasks
+    app_bot.post_init=lambda app: asyncio.create_task(start_tasks(app))
     print("🤖 Telegram bot starting...")
     app_bot.run_polling()
 
