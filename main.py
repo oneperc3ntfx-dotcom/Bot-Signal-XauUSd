@@ -5,7 +5,6 @@ import json
 from threading import Thread
 from datetime import datetime, timedelta
 import pytz
-import pandas as pd
 import websockets
 from flask import Flask
 from telegram import Update
@@ -17,21 +16,22 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Messa
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 AUTHORIZED_USER_ID = int(os.environ.get("AUTHORIZED_USER_ID", "0"))
-FINNHUB_TOKEN = os.environ.get("FINNHUB_TOKEN")
-PAIR_SYMBOL = "OANDA:XAU_USD"
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
+PAIR_SYMBOL = "C:XAUUSD"  # Pair untuk Polygon Forex format
 FLASK_PORT = int(os.environ.get("PORT", "8080"))
 JKT = pytz.timezone("Asia/Jakarta")
 
-if not BOT_TOKEN or not CHAT_ID or not FINNHUB_TOKEN:
-    raise SystemExit("ERROR: BOT_TOKEN, CHAT_ID, dan FINNHUB_TOKEN harus di-set di environment")
+if not BOT_TOKEN or not CHAT_ID or not POLYGON_API_KEY:
+    raise SystemExit("❌ ERROR: BOT_TOKEN, CHAT_ID, dan POLYGON_API_KEY harus diatur di environment")
 
 # ====================
-# Keep alive (Flask)
+# KEEP ALIVE (Flask)
 # ====================
 app = Flask(__name__)
+
 @app.route("/")
 def home():
-    return "Bot is running."
+    return "✅ Bot is running (Polygon.io WebSocket)."
 
 def keep_alive():
     Thread(target=lambda: app.run(host="0.0.0.0", port=FLASK_PORT), daemon=True).start()
@@ -50,7 +50,7 @@ def is_working_time(now_jkt):
     if wd >= 5:  # Sabtu/Minggu off
         return False
     hour = now_jkt.hour
-    return (hour >= 6) or (hour < 4)  # sesi trading utama
+    return (hour >= 6 and hour < 4 + 24)  # aktif 06:00–04:00 WIB
 
 # ====================
 # SIGNAL GENERATOR
@@ -62,7 +62,7 @@ async def send_random_signal(app_bot):
         return
 
     arah = "BUY" if (os.urandom(1)[0] % 2 == 0) else "SELL"
-    pip = 0.1  # 1 pip = 0.1 untuk XAU/USD
+    pip = 0.1  # 1 pip = 0.1 untuk XAUUSD
 
     if arah == "BUY":
         tp1 = round(last_price + 25 * pip, 2)
@@ -92,31 +92,36 @@ async def send_random_signal(app_bot):
         print("❌ Gagal kirim sinyal:", e)
 
 # ====================
-# FINNHUB WEBSOCKET
+# POLYGON.IO WEBSOCKET
 # ====================
-async def finnhub_ws(app_bot):
+async def polygon_ws(app_bot):
     global last_price, initial_signal_sent
-    url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
+    url = "wss://socket.polygon.io/forex"
+    headers = {"User-Agent": "SignalBot/1.0"}
+    auth_msg = json.dumps({"action": "auth", "params": POLYGON_API_KEY})
+    sub_msg = json.dumps({"action": "subscribe", "params": PAIR_SYMBOL})
+
     while True:
         try:
-            async with websockets.connect(url, ping_interval=None) as ws:
-                sub = json.dumps({"type": "subscribe", "symbol": PAIR_SYMBOL})
-                await ws.send(sub)
-                print(f"✅ Subscribed ke {PAIR_SYMBOL} via Finnhub WebSocket")
+            async with websockets.connect(url, extra_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+                await ws.send(auth_msg)
+                await ws.send(sub_msg)
+                print(f"✅ Terhubung ke Polygon.io WebSocket dan subscribe {PAIR_SYMBOL}")
 
-                async for msg in ws:
-                    data = json.loads(msg)
-                    if data.get("type") == "trade":
-                        for t in data["data"]:
-                            price = t["p"]
-                            last_price = price
-                            ts = datetime.utcfromtimestamp(t["t"] / 1000).replace(tzinfo=pytz.utc)
-                            print(f"💲 Tick {ts.strftime('%Y-%m-%d %H:%M:%S')} UTC: {price}")
+                async for message in ws:
+                    data = json.loads(message)
+                    if isinstance(data, list):
+                        for d in data:
+                            if d.get("p"):  # price
+                                last_price = float(d["p"])
+                                ts = datetime.utcfromtimestamp(d["t"] / 1000).replace(tzinfo=pytz.utc)
+                                print(f"💲 Tick {ts.strftime('%Y-%m-%d %H:%M:%S')} UTC: {last_price}")
 
-                            # Kirim sinyal pertama setelah tick pertama
-                            if not initial_signal_sent:
-                                initial_signal_sent = True
-                                await send_random_signal(app_bot)
+                                if not initial_signal_sent:
+                                    initial_signal_sent = True
+                                    await send_random_signal(app_bot)
+                    elif "status" in data:
+                        print("ℹ️", data)
         except Exception as e:
             print("⚠️ WebSocket error:", e)
             await asyncio.sleep(5)
@@ -139,7 +144,7 @@ async def schedule_task(app_bot):
         await send_random_signal(app_bot)
 
 # ====================
-# TELEGRAM HANDLERS
+# TELEGRAM COMMANDS
 # ====================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -176,11 +181,11 @@ def main():
     app_bot.add_handler(MessageHandler(filters.COMMAND, lambda u, c: None))
 
     async def start_tasks(app_bot):
-        asyncio.create_task(finnhub_ws(app_bot))
+        asyncio.create_task(polygon_ws(app_bot))
         asyncio.create_task(schedule_task(app_bot))
 
     app_bot.post_init = start_tasks
-    print("🤖 Bot random signal aktif (Finnhub realtime)...")
+    print("🤖 Bot random signal aktif (Polygon.io realtime)...")
     app_bot.run_polling()
 
 if __name__ == "__main__":
