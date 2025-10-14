@@ -13,7 +13,7 @@ from telegram.ext import Updater, CommandHandler, CallbackContext
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID"))
-FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
+FINNHUB_TOKENS = os.getenv("FINNHUB_TOKEN", "").split(",")  # support multi-key, comma-separated
 PAIR_SYMBOL = os.getenv("PAIR_SYMBOL", "XAU/USD")
 
 bot = Bot(token=BOT_TOKEN)
@@ -21,18 +21,25 @@ last_signal_time = None
 
 
 # ==========================
-# Fetch Realtime Price (Finnhub)
+# Fetch Realtime Price (Finnhub with rotation)
 # ==========================
 def fetch_realtime_price():
-    try:
-        symbol = f"OANDA:{PAIR_SYMBOL.replace('/', '_')}"
-        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_TOKEN}"
-        res = requests.get(url, timeout=10).json()
-        price = res.get("c", None)
-        if price:
-            return round(price, 2)
-    except Exception as e:
-        print("⚠️ Finnhub error:", e)
+    """Ambil harga realtime dari Finnhub, otomatis rotasi API key bila gagal"""
+    symbol = f"OANDA:{PAIR_SYMBOL.replace('/', '_')}"
+    for token in FINNHUB_TOKENS:
+        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={token.strip()}"
+        try:
+            res = requests.get(url, timeout=10).json()
+            price = res.get("c", None)
+            if price:
+                return round(price, 2)
+            else:
+                print(f"⚠️ API key {token[:8]}... gagal respon valid: {res}")
+        except Exception as e:
+            print(f"⚠️ Error pada API key {token[:8]}... : {e}")
+        time.sleep(1)  # jeda 1 detik sebelum coba key berikutnya
+
+    print("❌ Semua API Finnhub gagal diakses.")
     return None
 
 
@@ -45,7 +52,7 @@ def generate_signal():
     price = fetch_realtime_price()
 
     if not price:
-        bot.send_message(chat_id=CHAT_ID, text="⚠️ Gagal mengambil harga realtime dari Finnhub.")
+        bot.send_message(chat_id=CHAT_ID, text="⚠️ Gagal mengambil harga realtime dari semua API Finnhub.")
         return
 
     direction = random.choice(["BUY", "SELL"])
@@ -93,7 +100,7 @@ def harga(update: Update, context: CallbackContext):
     if price:
         update.message.reply_text(f"💰 Harga {PAIR_SYMBOL} saat ini: {price}")
     else:
-        update.message.reply_text("⚠️ Gagal mengambil harga realtime.")
+        update.message.reply_text("⚠️ Gagal mengambil harga realtime dari semua API key Finnhub.")
 
 
 def status(update: Update, context: CallbackContext):
@@ -132,14 +139,13 @@ schedule.every().day.at("17:00").do(job)
 
 print("🤖 Bot signal random aktif. Menunggu jadwal 00:00 WIB ...")
 
-# Kirim sinyal langsung saat bot pertama kali aktif
+# Kirim sinyal awal saat bot pertama kali aktif
 try:
     print("🚀 Mengirim sinyal awal setelah deploy...")
     generate_signal()
 except Exception as e:
     print("❌ Gagal mengirim sinyal awal:", e)
 
-# Jalankan polling dan scheduler
 updater.start_polling()
 
 while True:
