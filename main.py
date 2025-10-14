@@ -1,153 +1,187 @@
+#!/usr/bin/env python3
 import os
-import time
-import requests
-import random
-import schedule
-import datetime
-from telegram import Bot, Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+import asyncio
+import json
+from threading import Thread
+from datetime import datetime, timedelta
+import pytz
+import pandas as pd
+import websockets
+from flask import Flask
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
-# ==========================
-# Load Environment Variables
-# ==========================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
-PAIR_SYMBOL = os.getenv("PAIR_SYMBOL", "XAU/USD")
+# ====================
+# CONFIG
+# ====================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
+AUTHORIZED_USER_ID = int(os.environ.get("AUTHORIZED_USER_ID", "0"))
+FINNHUB_TOKEN = os.environ.get("FINNHUB_TOKEN")
+PAIR_SYMBOL = "OANDA:XAU_USD"
+FLASK_PORT = int(os.environ.get("PORT", "8080"))
+JKT = pytz.timezone("Asia/Jakarta")
 
-bot = Bot(token=BOT_TOKEN)
-last_signal_time = None
+if not BOT_TOKEN or not CHAT_ID or not FINNHUB_TOKEN:
+    raise SystemExit("ERROR: BOT_TOKEN, CHAT_ID, dan FINNHUB_TOKEN harus di-set di environment")
 
+# ====================
+# Keep alive (Flask)
+# ====================
+app = Flask(__name__)
+@app.route("/")
+def home():
+    return "Bot is running."
 
-# ==========================
-# Fetch Realtime Price (Yahoo Finance)
-# ==========================
-def fetch_realtime_price():
-    """
-    Ambil harga realtime dari Yahoo Finance.
-    Contoh simbol:
-    - XAU/USD → XAUUSD=X
-    - EUR/USD → EURUSD=X
-    - GBP/USD → GBPUSD=X
-    """
-    try:
-        yahoo_symbol = f"{PAIR_SYMBOL.replace('/', '')}=X"
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?interval=1m"
-        res = requests.get(url, timeout=10).json()
+def keep_alive():
+    Thread(target=lambda: app.run(host="0.0.0.0", port=FLASK_PORT), daemon=True).start()
 
-        price = res["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        if price:
-            return round(price, 2)
-    except Exception as e:
-        print("⚠️ Yahoo Finance error:", e)
-    return None
+# ====================
+# GLOBALS
+# ====================
+last_price = None
+initial_signal_sent = False
 
+# ====================
+# TIME FILTER
+# ====================
+def is_working_time(now_jkt):
+    wd = now_jkt.weekday()
+    if wd >= 5:  # Sabtu/Minggu off
+        return False
+    hour = now_jkt.hour
+    return (hour >= 6) or (hour < 4)  # sesi trading utama
 
-# ==========================
-# Generate Random Signal
-# ==========================
-def generate_signal():
-    """Random BUY/SELL dengan harga realtime dan TP/SL tetap"""
-    global last_signal_time
-    price = fetch_realtime_price()
-
-    if not price:
-        bot.send_message(chat_id=CHAT_ID, text="⚠️ Gagal mengambil harga realtime dari Yahoo Finance.")
+# ====================
+# SIGNAL GENERATOR
+# ====================
+async def send_random_signal(app_bot):
+    global last_price
+    if last_price is None:
+        print("⚠️ Belum ada harga realtime untuk kirim sinyal.")
         return
 
-    direction = random.choice(["BUY", "SELL"])
-    pip_value = 0.1  # 1 pip = 0.1 untuk XAU/USD (bisa disesuaikan)
+    arah = "BUY" if (os.urandom(1)[0] % 2 == 0) else "SELL"
+    pip = 0.1  # 1 pip = 0.1 untuk XAU/USD
 
-    if direction == "BUY":
-        tp1 = round(price + (25 * pip_value), 2)
-        tp2 = round(price + (50 * pip_value), 2)
-        sl = round(price - (15 * pip_value), 2)
+    if arah == "BUY":
+        tp1 = round(last_price + 25 * pip, 2)
+        tp2 = round(last_price + 50 * pip, 2)
+        sl = round(last_price - 15 * pip, 2)
     else:
-        tp1 = round(price - (25 * pip_value), 2)
-        tp2 = round(price - (50 * pip_value), 2)
-        sl = round(price + (15 * pip_value), 2)
+        tp1 = round(last_price - 25 * pip, 2)
+        tp2 = round(last_price - 50 * pip, 2)
+        sl = round(last_price + 15 * pip, 2)
 
-    message = (
-        f"📊 Pair: {PAIR_SYMBOL}\n"
-        f"🕒 Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"💰 Harga Entry: {price}\n"
-        f"📈 Arah: {direction}\n"
+    now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
+    msg = (
+        f"📊 Pair: XAU/USD\n"
+        f"🕒 Time: {now} WIB\n"
+        f"💰 Harga Entry: {last_price:.2f}\n"
+        f"📈 Arah: {arah}\n"
         f"🎯 TP1: {tp1}\n"
         f"🎯 TP2: {tp2}\n"
         f"🛑 SL: {sl}\n\n"
-        "⚠️ GUNAKAN MONEY MANAGEMENT SESUAI EQUITAS , JANGAN FULL MARGIN !!"
+        f"⚠️ GUNAKAN MONEY MANAGEMENT SESUAI EQUITAS, JANGAN FULL MARGIN!!"
     )
 
-    bot.send_message(chat_id=CHAT_ID, text=message)
-    last_signal_time = datetime.datetime.now()
+    try:
+        await app_bot.bot.send_message(chat_id=CHAT_ID, text=msg)
+        print(f"✅ Sinyal {arah} dikirim pada {now}")
+    except Exception as e:
+        print("❌ Gagal kirim sinyal:", e)
 
+# ====================
+# FINNHUB WEBSOCKET
+# ====================
+async def finnhub_ws(app_bot):
+    global last_price, initial_signal_sent
+    url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=None) as ws:
+                sub = json.dumps({"type": "subscribe", "symbol": PAIR_SYMBOL})
+                await ws.send(sub)
+                print(f"✅ Subscribed ke {PAIR_SYMBOL} via Finnhub WebSocket")
 
-# ==========================
-# Telegram Commands
-# ==========================
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "🤖 Halo! Bot signal random aktif.\n\n"
-        "Perintah yang tersedia:\n"
-        "• /harga → Cek harga realtime\n"
-        "• /signal → Kirim sinyal BUY/SELL acak\n"
-        "• /status → Lihat status bot\n"
-    )
+                async for msg in ws:
+                    data = json.loads(msg)
+                    if data.get("type") == "trade":
+                        for t in data["data"]:
+                            price = t["p"]
+                            last_price = price
+                            ts = datetime.utcfromtimestamp(t["t"] / 1000).replace(tzinfo=pytz.utc)
+                            print(f"💲 Tick {ts.strftime('%Y-%m-%d %H:%M:%S')} UTC: {price}")
 
+                            # Kirim sinyal pertama setelah tick pertama
+                            if not initial_signal_sent:
+                                initial_signal_sent = True
+                                await send_random_signal(app_bot)
+        except Exception as e:
+            print("⚠️ WebSocket error:", e)
+            await asyncio.sleep(5)
 
-def harga(update: Update, context: CallbackContext):
-    price = fetch_realtime_price()
-    if price:
-        update.message.reply_text(f"💰 Harga {PAIR_SYMBOL} saat ini: {price}")
+# ====================
+# SCHEDULER (SETIAP JAM)
+# ====================
+async def schedule_task(app_bot):
+    while True:
+        now = datetime.now(JKT)
+        next_run = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        wait = (next_run - now).total_seconds()
+        print(f"⏱ Next scheduled signal at {next_run.strftime('%Y-%m-%d %H:%M:%S')} WIB (in {int(wait)}s)")
+        await asyncio.sleep(wait)
+
+        if not is_working_time(datetime.now(JKT)):
+            print("⏸ Di luar jam kerja trading.")
+            continue
+
+        await send_random_signal(app_bot)
+
+# ====================
+# TELEGRAM HANDLERS
+# ====================
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if u and u.id == AUTHORIZED_USER_ID:
+        await update.message.reply_text("✅ Bot aktif.\nGunakan /signal untuk kirim sinyal manual.")
     else:
-        update.message.reply_text("⚠️ Gagal mengambil harga realtime dari Yahoo Finance.")
+        await update.message.reply_text("🚫 Tidak diizinkan.")
 
+async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not u or u.id != AUTHORIZED_USER_ID:
+        await update.message.reply_text("🚫 Tidak diizinkan.")
+        return
+    await update.message.reply_text("📡 Mengirim sinyal manual...")
+    await send_random_signal(context.application)
+    await update.message.reply_text("✅ Sinyal manual terkirim.")
 
-def status(update: Update, context: CallbackContext):
-    if last_signal_time:
-        msg = f"✅ Bot aktif.\n🕒 Sinyal terakhir: {last_signal_time.strftime('%Y-%m-%d %H:%M:%S')}"
+async def harga_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if last_price is None:
+        await update.message.reply_text("⏳ Harga realtime belum tersedia.")
     else:
-        msg = "✅ Bot aktif dan berjalan normal.\n❌ Belum ada sinyal dikirim."
-    update.message.reply_text(msg)
+        now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
+        await update.message.reply_text(f"💰 Harga realtime XAU/USD: {last_price:.2f}\n🕒 {now} WIB")
 
+# ====================
+# MAIN
+# ====================
+def main():
+    keep_alive()
+    app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start_cmd))
+    app_bot.add_handler(CommandHandler("signal", signal_cmd))
+    app_bot.add_handler(CommandHandler("harga", harga_cmd))
+    app_bot.add_handler(MessageHandler(filters.COMMAND, lambda u, c: None))
 
-def manual_signal(update: Update, context: CallbackContext):
-    generate_signal()
-    update.message.reply_text("✅ Sinyal acak dikirim ke channel.")
+    async def start_tasks(app_bot):
+        asyncio.create_task(finnhub_ws(app_bot))
+        asyncio.create_task(schedule_task(app_bot))
 
+    app_bot.post_init = start_tasks
+    print("🤖 Bot random signal aktif (Finnhub realtime)...")
+    app_bot.run_polling()
 
-# ==========================
-# Scheduler (Setiap Jam 00:00 WIB)
-# ==========================
-def job():
-    generate_signal()
-
-
-# ==========================
-# Main
-# ==========================
-updater = Updater(BOT_TOKEN, use_context=True)
-dp = updater.dispatcher
-
-dp.add_handler(CommandHandler("start", start))
-dp.add_handler(CommandHandler("harga", harga))
-dp.add_handler(CommandHandler("status", status))
-dp.add_handler(CommandHandler("signal", manual_signal))
-
-# Jadwal kirim sinyal otomatis jam 00:00 WIB (17:00 UTC di Railway)
-schedule.every().day.at("17:00").do(job)
-
-print("🤖 Bot signal random aktif (Yahoo Finance). Menunggu jadwal 00:00 WIB ...")
-
-# Kirim sinyal awal saat bot pertama kali aktif
-try:
-    print("🚀 Mengirim sinyal awal setelah deploy...")
-    generate_signal()
-except Exception as e:
-    print("❌ Gagal mengirim sinyal awal:", e)
-
-updater.start_polling()
-
-while True:
-    schedule.run_pending()
-    time.sleep(1)
+if __name__ == "__main__":
+    main()
