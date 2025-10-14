@@ -5,25 +5,28 @@ import schedule
 import datetime
 import pandas as pd
 import numpy as np
-from telegram import Bot
+from telegram import Bot, Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
 # ==========================
 # Load Environment Variables
 # ==========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-AUTHORIZED_USER_ID = os.getenv("AUTHORIZED_USER_ID")
 TD_API_KEYS = os.getenv("TD_API_KEYS", "").split(",")
 FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
 PAIR_SYMBOL = os.getenv("PAIR_SYMBOL", "XAU/USD")
 CANDLE_INTERVAL_MIN = int(os.getenv("CANDLE_INTERVAL_MIN", 5))
 
-# Cek token
 if not BOT_TOKEN or not CHAT_ID:
     print("❌ ERROR: BOT_TOKEN atau CHAT_ID tidak ditemukan di environment.")
     exit(1)
 
 bot = Bot(token=BOT_TOKEN)
+updater = Updater(BOT_TOKEN, use_context=True)
+dispatcher = updater.dispatcher
+
+last_signal_time = None
 
 # ==========================
 # Fetch Candle Data
@@ -42,7 +45,7 @@ def fetch_candle_data():
         if "values" in data:
             df = pd.DataFrame(data["values"])
             df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
-            df = df[::-1]  # urutkan dari paling lama ke terbaru
+            df = df[::-1]
             return df
         else:
             print("⚠️ Tidak ada data candle dari Twelve Data:", data)
@@ -50,6 +53,19 @@ def fetch_candle_data():
     except Exception as e:
         print("❌ Error fetch candle:", e)
         return pd.DataFrame()
+
+# ==========================
+# Fetch Realtime Price
+# ==========================
+def fetch_realtime_price():
+    try:
+        symbol = PAIR_SYMBOL.replace("/", "")
+        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_TOKEN}"
+        res = requests.get(url, timeout=10).json()
+        return res.get("c", None)  # Current price
+    except Exception as e:
+        print("❌ Error fetch realtime price:", e)
+        return None
 
 # ==========================
 # Compute Indicators
@@ -93,7 +109,6 @@ def analyze_candles(df):
     score = 0
     reasons = []
 
-    # Trend (SMA & EMA)
     if last['close'] > last['SMA20'] and last['close'] > last['EMA20']:
         score += 2
         reasons.append("Trend naik (SMA/EMA)")
@@ -101,7 +116,6 @@ def analyze_candles(df):
         score -= 2
         reasons.append("Trend turun (SMA/EMA)")
 
-    # RSI
     if last['RSI'] > 70:
         score -= 2
         reasons.append("Overbought (RSI)")
@@ -109,7 +123,6 @@ def analyze_candles(df):
         score += 2
         reasons.append("Oversold (RSI)")
 
-    # MACD
     if last['MACD'] > last['MACD_signal'] and prev['MACD'] <= prev['MACD_signal']:
         score += 1
         reasons.append("MACD bullish crossover")
@@ -117,7 +130,6 @@ def analyze_candles(df):
         score -= 1
         reasons.append("MACD bearish crossover")
 
-    # Bollinger Bands
     if last['close'] > last['BB_upper']:
         score -= 1
         reasons.append("Harga di atas BB atas (kemungkinan retrace)")
@@ -125,7 +137,6 @@ def analyze_candles(df):
         score += 1
         reasons.append("Harga di bawah BB bawah (kemungkinan rebound)")
 
-    # Stochastic
     if last['%K'] > 80 and last['%D'] > 80:
         score -= 1
         reasons.append("Overbought (Stochastic)")
@@ -133,7 +144,6 @@ def analyze_candles(df):
         score += 1
         reasons.append("Oversold (Stochastic)")
 
-    # Kesimpulan akhir
     if score > 1:
         signal = "BUY"
         tp = last['close'] * 1.01
@@ -154,9 +164,10 @@ def analyze_candles(df):
     }
 
 # ==========================
-# Telegram
+# Send Signal to Telegram
 # ==========================
 def send_signal():
+    global last_signal_time
     df = fetch_candle_data()
     if df.empty or len(df) < 30:
         print("⚠️ Data candle kosong atau kurang untuk analisa.")
@@ -175,36 +186,67 @@ def send_signal():
 
     try:
         bot.send_message(chat_id=CHAT_ID, text=message)
+        last_signal_time = datetime.datetime.now()
         print("✅ Signal terkirim ke Telegram.")
     except Exception as e:
         print("❌ Gagal kirim ke Telegram:", e)
 
 # ==========================
+# Command Handlers
+# ==========================
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "🤖 Halo! Bot signal trading aktif.\n\n"
+        "Perintah yang tersedia:\n"
+        "/harga - Cek harga realtime\n"
+        "/signal - Kirim sinyal analisa terbaru\n"
+        "/status - Lihat status bot"
+    )
+
+def harga(update: Update, context: CallbackContext):
+    price = fetch_realtime_price()
+    if price:
+        update.message.reply_text(f"💰 Harga {PAIR_SYMBOL} saat ini: {price}")
+    else:
+        update.message.reply_text("⚠️ Gagal mengambil harga realtime.")
+
+def signal_now(update: Update, context: CallbackContext):
+    send_signal()
+    update.message.reply_text("✅ Sinyal terbaru dikirim ke channel.")
+
+def status(update: Update, context: CallbackContext):
+    global last_signal_time
+    status_msg = "✅ Bot aktif dan berjalan normal.\n"
+    if last_signal_time:
+        status_msg += f"📅 Sinyal terakhir dikirim: {last_signal_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    else:
+        status_msg += "❌ Belum ada sinyal dikirim."
+    update.message.reply_text(status_msg)
+
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("harga", harga))
+dispatcher.add_handler(CommandHandler("signal", signal_now))
+dispatcher.add_handler(CommandHandler("status", status))
+
+# ==========================
 # Scheduler
 # ==========================
-def is_working_hours():
-    now = datetime.datetime.now()
-    if now.weekday() >= 5:  # Sabtu/Minggu
-        return False
-    start = now.replace(hour=5, minute=0, second=0, microsecond=0)
-    end = (start + datetime.timedelta(days=1)) - datetime.timedelta(hours=1)
-    break_start = now.replace(hour=23, minute=0, second=0, microsecond=0)
-    break_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
-    return start <= now <= end and not (break_start <= now <= break_end)
-
 def job():
-    if is_working_hours():
+    now = datetime.datetime.now()
+    if now.weekday() < 5:  # Senin - Jumat
         send_signal()
     else:
-        print("⏸️ Di luar jam kerja bot.")
+        print("⏸️ Akhir pekan, bot tidak aktif.")
 
-# Schedule tiap jam 00:00
-schedule.every().day.at("00:00").do(job)
+# 00:00 WIB = 17:00 UTC
+schedule.every().day.at("17:00").do(job)
 
 # ==========================
 # Run bot
 # ==========================
-print("🤖 Bot signal trading aktif. Menunggu jadwal 00:00 ...")
+print("🤖 Bot signal trading aktif. Menunggu jadwal 00:00 WIB dan siap menerima chat...")
+
+updater.start_polling()  # biar bisa respon chat
 
 while True:
     try:
