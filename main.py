@@ -132,6 +132,14 @@ schedule.every().day.at("17:00").do(job)
 
 print("🤖 Bot signal random aktif. Menunggu jadwal 00:00 WIB ...")
 
+# Kirim sinyal langsung saat bot pertama kali aktif
+try:
+    print("🚀 Mengirim sinyal awal setelah deploy...")
+    generate_signal()
+except Exception as e:
+    print("❌ Gagal mengirim sinyal awal:", e)
+
+# Jalankan polling dan scheduler
 updater.start_polling()
 
 while True:
