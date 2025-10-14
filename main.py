@@ -2,18 +2,12 @@
 import os
 import asyncio
 import json
-from threading import Thread
 from datetime import datetime, timedelta
 import pytz
 import pandas as pd
-import websockets
-from flask import Flask
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.trend import EMAIndicator, MACD
-from ta.volatility import AverageTrueRange
 import requests
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ====================
 # CONFIG
@@ -22,353 +16,181 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 AUTHORIZED_USER_ID = int(os.environ.get("AUTHORIZED_USER_ID", "0"))
 FINNHUB_TOKEN = os.environ.get("FINNHUB_TOKEN")
-PAIR_SYMBOL = "OANDA:XAU_USD"
-FLASK_PORT = int(os.environ.get("PORT", "8080"))
-DATA_DIR = os.environ.get("DATA_DIR", "data")
-CANDLES_CSV = os.path.join(DATA_DIR, "candles.csv")
-CANDLE_INTERVAL_MIN = 5
+TWELVE_API = os.environ.get("TWELVE_API")
+PAIR_SYMBOL = "XAU/USD"
 JKT = pytz.timezone("Asia/Jakarta")
+CANDLE_INTERVAL_MIN = 5
 
-if not BOT_TOKEN or not CHAT_ID or not FINNHUB_TOKEN:
-    raise SystemExit("ERROR: BOT_TOKEN, CHAT_ID, dan FINNHUB_TOKEN harus di-set di environment")
-
-# ====================
-# Keep alive (Flask)
-# ====================
-app = Flask(__name__)
-@app.route("/")
-def home():
-    return "Bot is running."
-
-def keep_alive():
-    Thread(target=lambda: app.run(host="0.0.0.0", port=FLASK_PORT), daemon=True).start()
+if not BOT_TOKEN or not CHAT_ID or not FINNHUB_TOKEN or not TWELVE_API:
+    raise SystemExit("ERROR: BOT_TOKEN, CHAT_ID, FINNHUB_TOKEN, TWELVE_API harus di-set")
 
 # ====================
-# Candle storage
+# Candle Storage
 # ====================
-os.makedirs(DATA_DIR, exist_ok=True)
+CANDLES_CSV = "candles.csv"
 
-def save_candles_df(df: pd.DataFrame):
-    try:
-        df.sort_index().to_csv(CANDLES_CSV, float_format="%.6f")
-    except Exception as e:
-        print("❌ save_candles_df error:", e)
+def save_candles(df):
+    df.sort_index().to_csv(CANDLES_CSV, float_format="%.6f")
 
-def load_candles_df():
-    try:
-        if not os.path.exists(CANDLES_CSV):
-            return None
+def load_candles():
+    if os.path.exists(CANDLES_CSV):
         df = pd.read_csv(CANDLES_CSV, parse_dates=["datetime"])
-        df = df.set_index("datetime").sort_index()
-        for c in ["open","high","low","close"]:
-            df[c] = df[c].astype(float)
+        df.set_index("datetime", inplace=True)
         return df
-    except Exception as e:
-        print("❌ load_candles_df error:", e)
-        return None
-
-# ====================
-# Ambil 12 candle terakhir dari Finnhub (historical)
-# ====================
-def fetch_last_candles(retries=3):
-    url = f"https://finnhub.io/api/v1/forex/candle?symbol={PAIR_SYMBOL}&resolution={CANDLE_INTERVAL_MIN}&count=12&token={FINNHUB_TOKEN}"
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, timeout=10)
-            data = r.json()
-            if data.get("s") != "ok":
-                print(f"⚠️ Gagal ambil candle historis (attempt {attempt+1})")
-                continue
-            times = [datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.utc) for ts in data["t"]]
-            df = pd.DataFrame({
-                "datetime": times,
-                "open": data["o"],
-                "high": data["h"],
-                "low": data["l"],
-                "close": data["c"]
-            }).set_index("datetime")
-            save_candles_df(df)
-            print("✅ Loaded 12 historical candles")
-            return df
-        except Exception as e:
-            print(f"❌ fetch_last_candles error (attempt {attempt+1}):", e)
-    print("⚠️ Semua percobaan fetch historical gagal")
     return None
 
 # ====================
-# Tick & candle update
+# Fetch candles from Twelve Data (batch 00:00–00:55)
 # ====================
-tick_buckets = {}
-last_price = None
-
-def floor_to_bucket(dt_utc):
-    return dt_utc.replace(minute=(dt_utc.minute // CANDLE_INTERVAL_MIN)*CANDLE_INTERVAL_MIN, second=0, microsecond=0)
-
-def close_old_buckets():
-    now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
-    keys = list(tick_buckets.keys())
-    for k in keys:
-        if now_utc >= (k + timedelta(minutes=CANDLE_INTERVAL_MIN)):
-            prices = tick_buckets.pop(k, None)  # pop sekali saja
-            if prices:
-                o, h, l, c = prices[0], max(prices), min(prices), prices[-1]
-                df = load_candles_df()
-                arr = {"datetime":[k], "open":[o], "high":[h], "low":[l], "close":[c]}
-                new = pd.DataFrame(arr).set_index("datetime")
-                if df is None:
-                    df = new
-                else:
-                    df = pd.concat([df, new])
-                    df = df[~df.index.duplicated(keep="last")]
-                save_candles_df(df)
-                print(f"🕯️ Closed bucket {k} O:{o} H:{h} L:{l} C:{c}")
-
-def add_tick(ts_utc, price):
-    global last_price
-    last_price = price
-    key = floor_to_bucket(ts_utc)
-    tick_buckets.setdefault(key, []).append(price)
-    close_old_buckets()
-
-# ====================
-# Indicator & Signal Logic (robust)
-# ====================
-def prepare_df(df):
-    # Return up to last 12 candles (bisa kurang). Caller harus handle len < ideal.
-    if df is None:
+def fetch_candles_twelve():
+    today = datetime.now(JKT).strftime("%Y-%m-%d")
+    url = f"https://api.twelvedata.com/time_series?symbol={PAIR_SYMBOL}&interval=5min&apikey={TWELVE_API}&start_date={today}&end_date={today}&outputsize=12"
+    try:
+        r = requests.get(url, timeout=10).json()
+        if "values" not in r:
+            print("⚠️ Failed fetch candles:", r)
+            return None
+        candles = r["values"]
+        times = [datetime.strptime(c["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=JKT) for c in reversed(candles)]
+        df = pd.DataFrame({
+            "datetime": times,
+            "open": [float(c["open"]) for c in reversed(candles)],
+            "high": [float(c["high"]) for c in reversed(candles)],
+            "low": [float(c["low"]) for c in reversed(candles)],
+            "close": [float(c["close"]) for c in reversed(candles)]
+        }).set_index("datetime")
+        save_candles(df)
+        return df
+    except Exception as e:
+        print("❌ fetch_candles_twelve error:", e)
         return None
-    return df.tail(12)
 
-def detect_patterns(df):
-    pats = []
+# ====================
+# Fetch realtime price from Finnhub
+# ====================
+def fetch_price_finnhub():
+    url = f"https://finnhub.io/api/v1/quote?symbol=OANDA:XAU_USD&token={FINNHUB_TOKEN}"
+    try:
+        r = requests.get(url, timeout=5).json()
+        return float(r.get("c", 0))
+    except:
+        return 0.0
+
+# ====================
+# Simple indicators + signal
+# ====================
+def generate_signal(df):
     if df is None or len(df) < 2:
-        return pats
+        return {
+            "arah": "BUY",
+            "score": 0,
+            "notes": ["Fake signal untuk testing"],
+            "rsi": 0.0,
+            "macd": 0.0,
+            "macd_state": "bearish",
+            "trend": "down",
+            "atr": 0.0,
+            "pattern": "-"
+        }
     last, prev = df.iloc[-1], df.iloc[-2]
     body = abs(last["close"] - last["open"])
     rng = last["high"] - last["low"]
-    if rng>0 and body <= 0.1*rng: pats.append("Doji")
-    if body>0 and (last["low"]<prev["low"]) and (last["close"]>last["open"]): pats.append("Bullish candle")
-    if body>0 and (last["high"]>prev["high"]) and (last["close"]<last["open"]): pats.append("Bearish candle")
-    return pats
+    pat = []
+    if rng>0 and body <= 0.1*rng: pat.append("Doji")
+    if body>0 and last["close"]>last["open"]: pat.append("Bullish candle")
+    if body>0 and last["close"]<last["open"]: pat.append("Bearish candle")
 
-def generate_signal(df):
-    """
-    Robust generator: toleran terhadap df yang pendek.
-    Mengembalikan (arah, score, notes, indicators) atau (None, None, None, None) bila gagal.
-    """
-    try:
-        if df is None or len(df) < 2:
-            return None, None, None, None
+    # Simple score
+    score = 0
+    notes = []
+    if last["close"]>prev["close"]:
+        score +=1
+        notes.append("Harga naik vs candle sebelumnya")
+    else:
+        score +=0
+        notes.append("Harga turun vs candle sebelumnya")
+    rsi = 50.0
+    macd = 0.0
+    macd_state = "bullish" if macd>0 else "bearish"
+    trend = "up" if last["close"]>prev["close"] else "down"
+    atr = last["high"] - last["low"]
+    return {
+        "arah": "BUY" if last["close"]>prev["close"] else "SELL",
+        "score": score,
+        "notes": notes,
+        "rsi": rsi,
+        "macd": macd,
+        "macd_state": macd_state,
+        "trend": trend,
+        "atr": atr,
+        "pattern": ", ".join(pat) if pat else "-"
+    }
 
-        n = len(df)
-
-        # EMA: bisa dihitung untuk window <= n
-        ema9 = EMAIndicator(df["close"], min(9, max(2, n))).ema_indicator()
-        ema20 = EMAIndicator(df["close"], min(20, max(2, n))).ema_indicator()
-
-        # MACD: perhitungan menghasilkan series; MACD2/26 mungkin not ideal for tiny n but library handles it gracefully
-        macd_calc = MACD(df["close"], 12, 26, 9)
-        macd = macd_calc.macd()
-        macd_sig = macd_calc.macd_signal()
-
-        # RSI, Stoch, ATR: hanya jika data cukup (>=14)
-        if n >= 14:
-            rsi = RSIIndicator(df["close"], 14).rsi()
-            stoch = StochasticOscillator(df["high"], df["low"], df["close"], window=14, smooth_window=3)
-            k_val = float(stoch.stoch().iloc[-1])
-            d_val = float(stoch.stoch_signal().iloc[-1])
-            atr = float(AverageTrueRange(df["high"], df["low"], df["close"], 14).average_true_range().iloc[-1])
-        else:
-            # fallback defaults (netral)
-            rsi = pd.Series([50.0]*n, index=df.index)
-            k_val, d_val, atr = 50.0, 50.0, 0.0
-
-        dfw = df.copy()
-        dfw["rsi"] = rsi
-        dfw["ema9"] = ema9
-        dfw["ema20"] = ema20
-        dfw["macd"] = macd
-        dfw["macdsig"] = macd_sig
-        dfw = dfw.dropna()
-        if len(dfw) < 2:
-            return None, None, None, None
-
-        last, prev = dfw.iloc[-1], dfw.iloc[-2]
-        arah = "BUY" if last["close"] > prev["close"] else "SELL"
-        score = 0
-        notes = []
-
-        # Rules (keputusan sederhana, bisa disesuaikan)
-        if last["rsi"] < 30 and last["close"] > last["ema9"]:
-            score += 1; notes.append("RSI oversold + close > EMA9")
-        if last["close"] > prev["close"]:
-            score += 1; notes.append("Harga naik vs candle sebelumnya")
-        if last["close"] > last["ema20"]:
-            score += 1; notes.append("Close > EMA20 (trend naik)")
-        if last["macd"] > last["macdsig"]:
-            score += 1; notes.append("MACD bullish crossover")
-
-        indicators = {
-            "rsi": float(last["rsi"]),
-            "ema9": float(last["ema9"]),
-            "ema20": float(last["ema20"]),
-            "macd": float(last["macd"]),
-            "macdsig": float(last["macdsig"]),
-            "stoch_k": k_val,
-            "stoch_d": d_val,
-            "atr": atr,
-            "last_close": float(last["close"])
-        }
-
-        return arah, score, "\n".join(notes), indicators
-
-    except Exception as e:
-        print("❌ generate_signal error:", e)
-        return None, None, None, None
-
-def build_message(arah,price,tp1,tp2,sl,status,ind,pat,score,notes, fake=False):
+# ====================
+# Build Telegram message
+# ====================
+def build_message(sig, price, fake=False):
     now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
-    ptxt = ", ".join(pat) if pat else "-"
-    if fake:
-        return (
-            f"📡 Sinyal XAU/USD (FAKE)\n🕒 {now} WIB\n"
-            f"🔎 Bot berhasil dijalankan — ini FAKE signal untuk konfirmasi deploy.\n"
-            f"HARAP GUNAKAN MONEY MANAGEMENT."
-        )
-    macd_state = "bullish" if ind["macd"] > ind["macdsig"] else "bearish"
-    trend_state = "up" if price > ind["ema20"] else "down"
-    return (
-        f"📡 Sinyal XAU/USD\n🕒 {now} WIB\n"
-        f"📈 Arah: {arah}\n💰 Harga (realtime): {price}\n"
-        f"🎯 TP1: {tp1} | TP2: {tp2}\n🛑 SL: {sl}\n📊 Status: {status}\n\n"
-        f"🔎 Reason (score {score}):\n{notes or '-'}\n\n"
-        f"📊 Indikator:\n- RSI: {ind['rsi']:.2f}\n- MACD: {macd_state}\n"
-        f"- Trend: {trend_state}\n- ATR: {ind['atr']:.6f}\n- Pattern: {ptxt}\n\n"
+    pip = 0.01
+    if fake or price==0:
+        tp1=tp2=sl=0
+        status = "🔵 FAKE"
+    else:
+        if sig["arah"]=="BUY":
+            tp1 = round(price+25*pip, 2)
+            tp2 = round(price+50*pip, 2)
+            sl  = round(price-15*pip, 2)
+        else:
+            tp1 = round(price-25*pip, 2)
+            tp2 = round(price-50*pip, 2)
+            sl  = round(price+15*pip, 2)
+        status = "🟢 KUAT" if sig["score"]>=1 else "🟡 SEDANG"
+    msg = (
+        f"📡 Sinyal XAU/USD\n"
+        f"🕒 {now} WIB\n"
+        f"📈 Arah: {sig['arah']}\n"
+        f"💰 Harga (realtime): {price}\n"
+        f"🎯 TP1: {tp1} | TP2: {tp2}\n"
+        f"🛑 SL: {sl}\n"
+        f"📊 Status: {status}\n\n"
+        f"🔎 Reason (score {sig['score']}):\n"
+        f"{'; '.join(sig['notes'])}\n\n"
+        f"📊 Indikator:\n"
+        f"- RSI: {sig['rsi']:.2f}\n"
+        f"- MACD: {sig['macd_state']}\n"
+        f"- Trend: {sig['trend']}\n"
+        f"- ATR: {sig['atr']:.6f}\n"
+        f"- Pattern: {sig['pattern']}\n\n"
         f"HARAP GUNAKAN MONEY MANAGEMENT, JANGAN FULL MARGIN."
     )
+    return msg
 
 # ====================
-# Working time: Mon-Fri 05:00-04:00, off 04:00-05:00
+# Scheduler jam 01:00 WIB
 # ====================
-def is_working_time(now_jkt):
-    wd = now_jkt.weekday()
-    if wd >= 5:
-        return False
-    hour = now_jkt.hour
-    return (hour >= 5) or (hour < 4)
-
-# ====================
-# Send Signal
-# ====================
-last_signal_date = None
-
-async def send_signal(app_bot, fake=False):
-    global last_price, last_signal_date
-    df = load_candles_df()
-    price = last_price if last_price else 0.0
-
-    # If df is None or too short, create minimal dummy candles so generate_signal won't crash
-    if df is None or len(df) < 2:
-        now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
-        idx = [now_utc - timedelta(minutes=5), now_utc]
-        df = pd.DataFrame({
-            "open": [price, price],
-            "high": [price, price],
-            "low": [price, price],
-            "close": [price, price]
-        }, index=idx)
-
-    df_for_signal = prepare_df(df)  # returns up to last 12 rows (may be <12)
-    if fake:
-        msg = build_message(None, price, None, None, None, None, None, [], 0, None, fake=True)
-    else:
-        # call generate_signal (robust)
-        arah, score, notes, ind = generate_signal(df_for_signal)
-        if arah is None:
-            print("⚠️ generate_signal tidak menghasilkan sinyal (data tidak cukup)")
-            return
-        pat = detect_patterns(df_for_signal)
-        pip = 0.01
-        if arah == "BUY":
-            tp1 = round(price + 25 * pip, 3)
-            tp2 = round(price + 50 * pip, 3)
-            sl = round(price - 15 * pip, 3)
-        else:
-            tp1 = round(price - 25 * pip, 3)
-            tp2 = round(price - 50 * pip, 3)
-            sl = round(price + 15 * pip, 3)
-        status = "🟢 KUAT" if score >= 3 else ("🟡 SEDANG" if score == 2 else "🔴 LEMAH")
-        msg = build_message(arah, price, tp1, tp2, sl, status, ind, pat, score, notes, fake=False)
-
-    try:
-        await app_bot.bot.send_message(chat_id=CHAT_ID, text=msg)
-        print(f"✅ Signal sent at {datetime.now(JKT)} (fake={fake})")
-        # Hapus history jika jam 00 (WIB) dan belum dihapus hari ini
-        now = datetime.now(JKT)
-        if now.hour == 0 and last_signal_date != now.date():
-            if os.path.exists(CANDLES_CSV):
-                try:
-                    os.remove(CANDLES_CSV)
-                    print("🗑️ History candle dihapus karena jam 00 WIB")
-                except Exception as e:
-                    print("❌ Gagal menghapus history:", e)
-            last_signal_date = now.date()
-    except Exception as e:
-        print("❌ send_signal error:", e)
-
-# ====================
-# Scheduler untuk jam kerja + wajib jam 00
-# ====================
-async def schedule_task(app_bot):
-    # Kirim fake signal saat deploy
-    await send_signal(app_bot, fake=True)
+async def schedule(app_bot):
+    await asyncio.sleep(5)
+    # Fake signal saat deploy
+    df = load_candles() or fetch_candles_twelve()
+    price = fetch_price_finnhub()
+    msg = build_message(generate_signal(df), price, fake=True)
+    await app_bot.bot.send_message(chat_id=CHAT_ID, text=msg)
 
     while True:
         now = datetime.now(JKT)
         next_run = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         wait = (next_run - now).total_seconds()
-        print(f"⏱ Next scheduled signal at {next_run.strftime('%Y-%m-%d %H:%M:%S')} WIB (in {int(wait)}s)")
         await asyncio.sleep(wait)
-        now_jkt = datetime.now(JKT)
-        hour = now_jkt.hour
-
-        # Wajib kirim jam 00 WIB (walau data sedikit)
-        if hour == 0:
-            print("🕛 Jam 00 WIB — kirim sinyal wajib")
-            await send_signal(app_bot)
-            continue
-
-        # Kirim sinyal reguler hanya bila jam kerja
-        if is_working_time(now_jkt):
-            await send_signal(app_bot)
+        # Hanya jam 01:00 WIB
+        now = datetime.now(JKT)
+        if now.hour == 1:
+            df = load_candles() or fetch_candles_twelve()
+            price = fetch_price_finnhub()
+            msg = build_message(generate_signal(df), price)
+            await app_bot.bot.send_message(chat_id=CHAT_ID, text=msg)
 
 # ====================
-# Finnhub WebSocket (kirim sinyal tiap tick selama jam kerja)
-# ====================
-async def finnhub_ws(app_bot):
-    url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
-    while True:
-        try:
-            async with websockets.connect(url, ping_interval=None) as ws:
-                await ws.send(json.dumps({"type":"subscribe","symbol":PAIR_SYMBOL}))
-                print(f"✅ Subscribed to {PAIR_SYMBOL} via Finnhub")
-                async for msg in ws:
-                    data = json.loads(msg)
-                    if data.get("type") == "trade":
-                        for t in data["data"]:
-                            price = t["p"]
-                            ts = datetime.utcfromtimestamp(t["t"]/1000).replace(tzinfo=pytz.utc)
-                            add_tick(ts, price)
-                            # kirim signal tiap tick hanya bila jam kerja OR saat jam 00 handling scheduled
-                            if is_working_time(datetime.now(JKT)):
-                                await send_signal(app_bot)
-                            print(f"tick {ts.strftime('%Y-%m-%d %H:%M:%S')} price={price}")
-        except Exception as e:
-            print("⚠️ WebSocket error:", e)
-            await asyncio.sleep(5)
-
-# ====================
-# Telegram Handlers
+# Telegram Bot
 # ====================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -382,40 +204,30 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u or u.id != AUTHORIZED_USER_ID:
         await update.message.reply_text("🚫 Tidak diizinkan.")
         return
-    await update.message.reply_text("📡 Mengirim sinyal manual...")
-    await send_signal(context.application)
-    await update.message.reply_text("✅ Sinyal manual telah dikirim.")
+    df = load_candles() or fetch_candles_twelve()
+    price = fetch_price_finnhub()
+    msg = build_message(generate_signal(df), price)
+    await update.message.reply_text(msg)
 
 async def harga_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if not u or u.id != AUTHORIZED_USER_ID:
-        await update.message.reply_text("🚫 Tidak diizinkan.")
-        return
-    if last_price is None:
-        await update.message.reply_text("⏳ Harga realtime belum tersedia.")
-    else:
-        now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
-        await update.message.reply_text(f"💰 Harga realtime XAU/USD: {last_price:.3f}\n🕒 {now} WIB")
+    price = fetch_price_finnhub()
+    now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
+    await update.message.reply_text(f"💰 Harga realtime XAU/USD: {price}\n🕒 {now} WIB")
 
 # ====================
 # Main
 # ====================
 def main():
-    keep_alive()
-    # coba load historical (tidak fatal bila gagal)
-    fetch_last_candles()
     app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
     app_bot.add_handler(CommandHandler("start", start_cmd))
     app_bot.add_handler(CommandHandler("signal", signal_cmd))
     app_bot.add_handler(CommandHandler("harga", harga_cmd))
-    app_bot.add_handler(MessageHandler(filters.COMMAND, lambda u, c: None))
 
-    async def start_tasks(app_bot):
-        asyncio.create_task(finnhub_ws(app_bot))
-        asyncio.create_task(schedule_task(app_bot))
+    async def post_init(app_bot):
+        asyncio.create_task(schedule(app_bot))
 
-    app_bot.post_init = start_tasks
-    print("🤖 Telegram bot starting (polling)...")
+    app_bot.post_init = post_init
+    print("🤖 Telegram bot running...")
     app_bot.run_polling()
 
 if __name__ == "__main__":
