@@ -57,11 +57,10 @@ def is_trading_time():
 # ==========================
 # RANDOM SIGNAL GENERATOR
 # ==========================
-async def send_random_signal(bot_app):
+async def generate_signal():
     global last_price
     if last_price is None:
-        print("⚠️ Belum ada harga realtime.")
-        return
+        return None
 
     direction = random.choice(["BUY", "SELL"])
     pip = 0.1  # untuk XAU/USD, 1 pip = 0.1
@@ -76,7 +75,7 @@ async def send_random_signal(bot_app):
         sl = round(last_price + 15 * pip, 2)
 
     now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
-    msg = (
+    return (
         f"📊 Pair: XAU/USD\n"
         f"🕒 Time: {now} WIB\n"
         f"💰 Harga Entry: {last_price:.2f}\n"
@@ -87,9 +86,15 @@ async def send_random_signal(bot_app):
         f"⚠️ PAKAI MONEY MANAGEMENT SESUAI EQUITAS , JANGAN FULL MARGIN !!"
     )
 
+async def send_random_signal(bot_app):
+    msg = await generate_signal()
+    if not msg:
+        print("⚠️ Belum ada harga realtime.")
+        return
     try:
         await bot_app.bot.send_message(chat_id=CHAT_ID, text=msg)
-        print(f"✅ {direction} signal dikirim pada {now}")
+        now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"✅ Sinyal dikirim ke channel pada {now}")
     except Exception as e:
         print("❌ Gagal kirim sinyal:", e)
 
@@ -143,19 +148,28 @@ async def hourly_signal(bot_app):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != AUTHORIZED_USER_ID:
         return await update.message.reply_text("🚫 Tidak diizinkan.")
-    await update.message.reply_text("✅ Bot aktif. Gunakan /signal untuk kirim sinyal manual.")
+    await update.message.reply_text("✅ Bot aktif.\nGunakan /signal (ke channel)\nGunakan /minta (ke pribadi)")
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != AUTHORIZED_USER_ID:
         return await update.message.reply_text("🚫 Tidak diizinkan.")
     await send_random_signal(context.application)
-    await update.message.reply_text("✅ Sinyal manual dikirim.")
+    await update.message.reply_text("✅ Sinyal dikirim ke channel.")
 
 async def harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if last_price is None:
         return await update.message.reply_text("⏳ Harga belum tersedia.")
     now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
     await update.message.reply_text(f"💰 Harga XAU/USD: {last_price:.2f}\n🕒 {now} WIB")
+
+# 🔥 Command baru: kirim sinyal hanya ke user pribadi
+async def minta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return await update.message.reply_text("🚫 Tidak diizinkan.")
+    msg = await generate_signal()
+    if not msg:
+        return await update.message.reply_text("⚠️ Harga belum tersedia.")
+    await update.message.reply_text(msg)
 
 # ==========================
 # MAIN
@@ -167,6 +181,7 @@ def main():
     app_bot.add_handler(CommandHandler("start", start))
     app_bot.add_handler(CommandHandler("signal", signal))
     app_bot.add_handler(CommandHandler("harga", harga))
+    app_bot.add_handler(CommandHandler("minta", minta))
     app_bot.add_handler(MessageHandler(filters.COMMAND, lambda u, c: None))
 
     async def post_init(app_bot):
