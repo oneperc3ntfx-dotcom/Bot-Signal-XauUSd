@@ -75,7 +75,14 @@ async def generate_signal():
         sl = round(last_price + 15 * pip, 2)
 
     now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
-    return (
+    
+    # ✅ Tambahan profesional di atas sinyal
+    header = (
+        "🤖 *Sinyal Otomatis dari AI Trading System*\n"
+        "_Sinyal ini dihasilkan secara otomatis oleh sistem AI yang telah dianalisis menggunakan berbagai strategi dan indikator teknikal untuk meningkatkan akurasi prediksi arah pasar._\n\n"
+    )
+
+    signal_text = (
         f"📊 Pair: XAU/USD\n"
         f"🕒 Time: {now} WIB\n"
         f"💰 Harga Entry: {last_price:.2f}\n"
@@ -86,13 +93,15 @@ async def generate_signal():
         f"⚠️ PAKAI MONEY MANAGEMENT SESUAI EQUITAS , JANGAN FULL MARGIN !!"
     )
 
+    return header + signal_text
+
 async def send_random_signal(bot_app):
     msg = await generate_signal()
     if not msg:
         print("⚠️ Belum ada harga realtime.")
         return
     try:
-        await bot_app.bot.send_message(chat_id=CHAT_ID, text=msg)
+        await bot_app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
         now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
         print(f"✅ Sinyal dikirim ke channel pada {now}")
     except Exception as e:
@@ -148,7 +157,12 @@ async def hourly_signal(bot_app):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != AUTHORIZED_USER_ID:
         return await update.message.reply_text("🚫 Tidak diizinkan.")
-    await update.message.reply_text("✅ Bot aktif.\nGunakan /signal (ke channel)\nGunakan /minta (ke pribadi)")
+    await update.message.reply_text(
+        "✅ Bot aktif.\nGunakan:\n"
+        "• /signal → kirim sinyal ke channel\n"
+        "• /minta → kirim sinyal pribadi\n"
+        "• /harga → lihat harga realtime"
+    )
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != AUTHORIZED_USER_ID:
@@ -169,7 +183,7 @@ async def minta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await generate_signal()
     if not msg:
         return await update.message.reply_text("⚠️ Harga belum tersedia.")
-    await update.message.reply_text(msg)
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 # ==========================
 # MAIN
