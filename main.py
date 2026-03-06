@@ -21,14 +21,14 @@ FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
 PAIR_SYMBOL = os.getenv("PAIR_SYMBOL", "OANDA:XAU_USD")
 FLASK_PORT = int(os.getenv("PORT", "8080"))
 
-# Channel targets (HANYA 2 CHANNEL)
+# CHANNEL TARGET
 HOURLY_CHANNELS = ["-1003142698012", "-1002605110502"]
 
-# Timezone
+# TIMEZONE
 JKT = pytz.timezone("Asia/Jakarta")
 
 if not BOT_TOKEN or not FINNHUB_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN dan FINNHUB_TOKEN wajib diatur di environment!")
+    raise SystemExit("❌ BOT_TOKEN dan FINNHUB_TOKEN wajib diatur!")
 
 # ==========================
 # LOGGING
@@ -36,9 +36,9 @@ if not BOT_TOKEN or not FINNHUB_TOKEN:
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("finnhub-bot")
+
+logger = logging.getLogger("AI-BOT")
 
 # ==========================
 # KEEP ALIVE SERVER
@@ -47,33 +47,43 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "✅ Bot Finnhub Realtime aktif."
+    return "Bot aktif"
 
 def keep_alive():
     Thread(target=lambda: app.run(host="0.0.0.0", port=FLASK_PORT), daemon=True).start()
-    logger.info("🌐 Keep-alive server started on port %s", FLASK_PORT)
+    logger.info("Keep Alive aktif")
 
 # ==========================
 # GLOBAL STATE
 # ==========================
 last_price = None
-last_update = None
 price_lock = asyncio.Lock()
-price_ready = asyncio.Event()
 
 # ==========================
 # TRADING SCHEDULE
+# SENIN 07:00 → SABTU 05:00
 # ==========================
-def is_trading_time(at: datetime = None) -> bool:
+def is_trading_time(at=None):
+
     if at is None:
         at = datetime.now(JKT)
 
     wd = at.weekday()
-    if wd >= 5:
-        return False
-
     hour = at.hour
-    return (5 <= hour < 23) or (0 <= hour < 4)
+
+    # Senin - Kamis
+    if wd in [0,1,2,3]:
+        return (7 <= hour <= 23) or (0 <= hour <= 5)
+
+    # Jumat
+    if wd == 4:
+        return (7 <= hour <= 23)
+
+    # Sabtu
+    if wd == 5:
+        return (0 <= hour <= 5)
+
+    return False
 
 # ==========================
 # SIGNAL GENERATOR
@@ -85,188 +95,145 @@ async def generate_signal_html():
             return None
         price = last_price
 
-    direction = random.choice(["BUY", "SELL"])
+    direction = random.choice(["BUY","SELL"])
     pip = 0.1
 
     if direction == "BUY":
-        tp1 = round(price + 70 * pip, 2)
-        tp2 = round(price + 100 * pip, 2)
-        sl = round(price - 45 * pip, 2)
+        tp1 = round(price + 7,2)
+        tp2 = round(price + 10,2)
+        sl = round(price - 4.5,2)
     else:
-        tp1 = round(price - 70 * pip, 2)
-        tp2 = round(price - 100 * pip, 2)
-        sl = round(price + 15 * pip, 2)
+        tp1 = round(price - 7,2)
+        tp2 = round(price - 10,2)
+        sl = round(price + 4.5,2)
 
-    now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M")
 
-    header = (
-        "<b>🤖 Sinyal Otomatis dari AI Trading System</b>\n"
-        "<i>Sinyal ini dihasilkan otomatis oleh sistem analisis pasar real-time.</i>\n\n"
-    )
+    msg = f"""
+<b>🤖 AI GOLD SIGNAL</b>
 
-    body = (
-        f"📊 Pair: <b>XAU/USD</b>\n"
-        f"🕒 Waktu: <b>{now} WIB</b>\n"
-        f"💰 Harga Entry: <b>{price:.2f}</b>\n"
-        f"📈 Arah: <b>{direction}</b>\n"
-        f"🎯 TP1: <b>{tp1}</b>\n"
-        f"🎯 TP2: <b>{tp2}</b>\n"
-        f"🛑 SL: <b>{sl}</b>\n\n"
-        f"⚠️ Gunakan money management yang aman!"
-    )
+📊 Pair : <b>XAU/USD</b>
+🕒 Time : <b>{now} WIB</b>
 
-    return header + body
+💰 Entry : <b>{price}</b>
+📈 Signal : <b>{direction}</b>
+
+🎯 TP1 : <b>{tp1}</b>
+🎯 TP2 : <b>{tp2}</b>
+
+🛑 SL : <b>{sl}</b>
+
+⚠️ Gunakan Money Management
+"""
+
+    return msg
 
 # ==========================
 # FINNHUB WEBSOCKET
 # ==========================
 async def finnhub_ws():
 
-    global last_price, last_update
+    global last_price
+
     url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
-    backoff = 1
 
     while True:
         try:
 
-            logger.info("🔗 Connecting to Finnhub WS...")
+            logger.info("Connecting Finnhub WS")
 
-            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-
-                backoff = 1
+            async with websockets.connect(url) as ws:
 
                 await ws.send(json.dumps({
-                    "type": "subscribe",
-                    "symbol": PAIR_SYMBOL
+                    "type":"subscribe",
+                    "symbol":PAIR_SYMBOL
                 }))
 
-                logger.info("✅ Subscribed ke %s via Finnhub WS", PAIR_SYMBOL)
+                logger.info("Subscribed %s",PAIR_SYMBOL)
 
                 async for msg in ws:
 
-                    try:
-                        data = json.loads(msg)
-                    except json.JSONDecodeError:
-                        continue
+                    data = json.loads(msg)
 
                     if data.get("type") == "trade":
 
-                        for t in data.get("data", []):
+                        for t in data["data"]:
 
                             async with price_lock:
                                 last_price = float(t["p"])
-                                last_update = datetime.utcnow()
-                                price_ready.set()
-
-                            ts = int(datetime.utcnow().timestamp())
-
-                            if ts % 5 == 0:
-                                logger.info(
-                                    "💲 Harga %s: %.2f @ %s UTC",
-                                    PAIR_SYMBOL,
-                                    last_price,
-                                    last_update.strftime("%H:%M:%S")
-                                )
 
         except Exception as e:
 
-            logger.warning("⚠️ WebSocket error: %s", e)
-
-            await asyncio.sleep(min(backoff, 60))
-
-            backoff = backoff * 2 if backoff < 60 else 60
-
-            logger.info("🔁 Reconnecting ke Finnhub...")
+            logger.warning("WS ERROR %s",e)
+            await asyncio.sleep(5)
 
 # ==========================
 # SEND SIGNAL
 # ==========================
-async def send_signal_to_chats(app, chat_ids):
+async def send_signal(app, chats):
 
     msg = await generate_signal_html()
 
     if not msg:
-        logger.warning("⚠️ Belum ada harga realtime.")
-        return False
+        logger.warning("Harga belum ada")
+        return
 
-    for cid in chat_ids:
+    for chat in chats:
 
         try:
 
             await app.bot.send_message(
-                chat_id=cid,
+                chat_id=chat,
                 text=msg,
                 parse_mode="HTML"
             )
 
-            logger.info(
-                "✅ Sinyal terkirim ke %s pada %s",
-                cid,
-                datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
-            )
+            logger.info("Signal terkirim ke %s",chat)
 
         except Exception as e:
 
-            logger.exception("❌ Gagal kirim ke %s: %s", cid, e)
+            logger.error("Gagal kirim %s",e)
 
 # ==========================
 # TELEGRAM COMMAND
 # ==========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
     if update.effective_user.id != AUTHORIZED_USER_ID:
-        return await update.message.reply_text("🚫 Tidak diizinkan.")
+        return
 
     await update.message.reply_text(
-        "✅ Bot aktif.\n"
-        "• /signal → kirim ke channel\n"
-        "• /minta → sinyal pribadi\n"
-        "• /harga → harga realtime"
+        "Bot aktif\n\n"
+        "/signal kirim signal\n"
+        "/harga cek harga"
     )
 
-async def harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def harga(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
     async with price_lock:
 
         if last_price is None:
-            return await update.message.reply_text("⏳ Harga belum tersedia.")
+            return await update.message.reply_text("Harga belum ada")
 
         price = last_price
 
-    now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
+    await update.message.reply_text(f"XAUUSD : {price}")
 
-    await update.message.reply_text(
-        f"💰 XAU/USD: {price:.2f}\n"
-        f"📅 {now} WIB"
-    )
-
-async def minta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def signal(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
     if update.effective_user.id != AUTHORIZED_USER_ID:
-        return await update.message.reply_text("🚫 Tidak diizinkan.")
+        return
 
-    msg = await generate_signal_html()
+    await send_signal(context.application,HOURLY_CHANNELS)
 
-    if not msg:
-        return await update.message.reply_text("⚠️ Harga belum tersedia.")
-
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_user.id != AUTHORIZED_USER_ID:
-        return await update.message.reply_text("🚫 Tidak diizinkan.")
-
-    await send_signal_to_chats(context.application, HOURLY_CHANNELS)
-
-    await update.message.reply_text("✅ Sinyal dikirim ke semua channel.")
+    await update.message.reply_text("Signal terkirim")
 
 # ==========================
 # HOURLY SCHEDULER
 # ==========================
 async def hourly_scheduler(app):
 
-    logger.info("⏰ Hourly scheduler started.")
+    logger.info("Scheduler aktif")
 
     while True:
 
@@ -278,15 +245,15 @@ async def hourly_scheduler(app):
             microsecond=0
         ) + timedelta(hours=1)
 
-        wait_seconds = (next_hour - now).total_seconds()
+        wait = (next_hour - now).total_seconds()
 
-        await asyncio.sleep(wait_seconds)
+        await asyncio.sleep(wait)
 
         if is_trading_time(next_hour):
 
-            logger.info("📤 Sending hourly signal")
+            logger.info("Kirim signal hourly")
 
-            await send_signal_to_chats(app, HOURLY_CHANNELS)
+            await send_signal(app,HOURLY_CHANNELS)
 
 # ==========================
 # MAIN
@@ -295,26 +262,25 @@ def main():
 
     keep_alive()
 
-    app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+    bot = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app_bot.add_handler(CommandHandler("start", start))
-    app_bot.add_handler(CommandHandler("harga", harga))
-    app_bot.add_handler(CommandHandler("minta", minta))
-    app_bot.add_handler(CommandHandler("signal", signal_cmd))
-    app_bot.add_handler(MessageHandler(filters.COMMAND, lambda u, c: None))
+    bot.add_handler(CommandHandler("start",start))
+    bot.add_handler(CommandHandler("harga",harga))
+    bot.add_handler(CommandHandler("signal",signal))
+    bot.add_handler(MessageHandler(filters.COMMAND,lambda u,c:None))
 
-    async def post_init(application):
+    async def post_init(app):
 
-        application.create_task(finnhub_ws())
-        application.create_task(hourly_scheduler(application))
+        app.create_task(finnhub_ws())
+        app.create_task(hourly_scheduler(app))
 
-        logger.info("🚀 Background tasks started")
+        logger.info("Background task started")
 
-    app_bot.post_init = post_init
+    bot.post_init = post_init
 
-    logger.info("🤖 Bot Finnhub AI Signal aktif")
+    logger.info("BOT AI SIGNAL AKTIF")
 
-    app_bot.run_polling()
+    bot.run_polling()
 
 if __name__ == "__main__":
     main()
