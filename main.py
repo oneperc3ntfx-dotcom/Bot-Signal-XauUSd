@@ -89,12 +89,12 @@ async def generate_signal_html():
     pip = 0.1
 
     if direction == "BUY":
-        tp1 = round(price + 25 * pip, 2)
-        tp2 = round(price + 50 * pip, 2)
-        sl = round(price - 15 * pip, 2)
+        tp1 = round(price + 70 * pip, 2)
+        tp2 = round(price + 100 * pip, 2)
+        sl = round(price - 45 * pip, 2)
     else:
-        tp1 = round(price - 25 * pip, 2)
-        tp2 = round(price - 50 * pip, 2)
+        tp1 = round(price - 70 * pip, 2)
+        tp2 = round(price - 100 * pip, 2)
         sl = round(price + 15 * pip, 2)
 
     now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
