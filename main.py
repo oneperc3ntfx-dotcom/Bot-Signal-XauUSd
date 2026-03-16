@@ -23,7 +23,8 @@ FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
 PAIR_SYMBOL = "OANDA:XAU_USD"
 FLASK_PORT = int(os.getenv("PORT", "8080"))
 
-HOURLY_CHANNELS = ["-1002605110502"] 
+# CHANNEL BARU
+HOURLY_CHANNELS = ["-1003142698012"]
 
 JKT = pytz.timezone("Asia/Jakarta")
 
@@ -39,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger("AI-BOT")
 
 # ==========================
-# KEEP ALIVE (RAILWAY)
+# KEEP ALIVE
 # ==========================
 
 app = Flask(__name__)
@@ -68,15 +69,14 @@ def is_trading_time(now=None):
     if not now:
         now = datetime.now(JKT)
 
-    wd = now.weekday()
+    weekday = now.weekday()
 
-    if wd >= 5:
+    if weekday >= 5:
         return False
 
     hour = now.hour
 
-    # 07:00 pagi sampai 05:00 pagi
-    if hour >= 7 or hour < 5:
+    if 8 <= hour <= 21:
         return True
 
     return False
@@ -113,21 +113,26 @@ async def generate_signal_html():
     now = datetime.now(JKT).strftime("%Y-%m-%d %H:%M:%S")
 
     msg = f"""
-🤖 <b>AI TRADING SIGNAL</b>
+🤖 <b>AI MARKET SIGNAL</b>
 
-Pair : <b>XAU/USD</b>
+Instrument : <b>XAU/USD (GOLD)</b>
 Time : {now} WIB
 
-Entry : <b>{price}</b>
+Direction : <b>{direction}</b>
 
-Signal : <b>{direction}</b>
+Entry Price : <b>{price}</b>
 
+Take Profit
 TP1 : {tp1}
 TP2 : {tp2}
 
+Stop Loss
 SL : {sl}
 
-⚠️ Gunakan money management
+━━━━━━━━━━━━━━━
+
+⚠️ Gunakan money management yang baik
+Risk per trade maksimal 1-3% dari equity
 """
 
     return msg
@@ -208,7 +213,7 @@ async def send_signal(app):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
-        "BOT AKTIF\n\n"
+        "🤖 AI SIGNAL BOT AKTIF\n\n"
         "/harga\n"
         "/minta\n"
         "/signal"
@@ -221,7 +226,7 @@ async def harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with price_lock:
 
         if last_price is None:
-            return await update.message.reply_text("Harga belum ada")
+            return await update.message.reply_text("Harga belum tersedia")
 
         price = last_price
 
@@ -297,11 +302,9 @@ def main():
 
     bot.post_init = post_init
 
-    logger.info("BOT AI SIGNAL AKTIF")
+    logger.info("AI GOLD SIGNAL BOT AKTIF")
 
     bot.run_polling()
-
-# ==========================
 
 if __name__ == "__main__":
     main()
