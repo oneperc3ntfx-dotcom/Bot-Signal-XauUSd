@@ -24,7 +24,7 @@ PAIR_SYMBOL = "OANDA:XAU_USD"
 FLASK_PORT = int(os.getenv("PORT", "8080"))
 
 # CHANNEL BARU
-HOURLY_CHANNELS = ["-1003142698012"]
+HOURLY_CHANNELS = ["-1002605110502"]
 
 JKT = pytz.timezone("Asia/Jakarta")
 
