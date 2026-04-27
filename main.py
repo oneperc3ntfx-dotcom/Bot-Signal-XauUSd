@@ -4,6 +4,7 @@ import json
 import asyncio
 import random
 import logging
+import requests
 from datetime import datetime, timedelta
 
 import pytz
@@ -13,9 +14,9 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ==========================
-# ENV
-# ==========================
+# =========================
+# LOAD ENV
+# =========================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -26,9 +27,9 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN tidak ditemukan!")
 
-# ==========================
+# =========================
 # CONFIG
-# ==========================
+# =========================
 PAIR = "OANDA:XAU_USD"
 WIB = pytz.timezone("Asia/Jakarta")
 
@@ -38,72 +39,75 @@ price_lock = asyncio.Lock()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("RANDOM-BOT")
 
-# ==========================
-# TRADING TIME (tetap jam kerja)
-# ==========================
+# =========================
+# DELETE WEBHOOK (ANTI CONFLICT)
+# =========================
+def clear_webhook():
+    try:
+        requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
+        )
+        logger.info("Webhook cleared")
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+
+# =========================
+# TRADING TIME
+# =========================
 def is_trading_time():
     now = datetime.now(WIB)
-
     if now.weekday() >= 5:
         return False
-
     return 8 <= now.hour < 21
 
-# ==========================
-# SIGNAL GENERATOR (RANDOM)
-# ==========================
+# =========================
+# SIGNAL ENGINE (RANDOM + STRUCTURED)
+# =========================
 async def generate_signal():
 
     async with price_lock:
-        if last_price is None:
+        if not last_price:
             return None
         price = last_price
 
-    now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
-
-    signal = random.choice(["BUY", "SELL"])
+    direction = random.choice(["BUY", "SELL"])
 
     pip = 0.1
 
-    if signal == "BUY":
-        tp1 = price + 70 * pip
-        tp2 = price + 100 * pip
-        sl = price - 40 * pip
+    if direction == "BUY":
+        tp1 = price + (70 * pip)
+        tp2 = price + (100 * pip)
+        sl = price - (40 * pip)
+        outlook = "Momentum bullish terdeteksi pada struktur intraday."
     else:
-        tp1 = price - 70 * pip
-        tp2 = price - 100 * pip
-        sl = price + 40 * pip
+        tp1 = price - (70 * pip)
+        tp2 = price - (100 * pip)
+        sl = price + (40 * pip)
+        outlook = "Tekanan bearish masih mendominasi struktur pasar."
+
+    now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
 
     return f"""
-🤖 AI RANDOM SIGNAL SYSTEM
+📊 XAUUSD SIGNAL
 
-🕒 Time : {now}
+🕒 Time : {now} WIB
 💰 Price : {price}
 
-📈 Direction : {signal}
+📈 Direction : {direction}
 
-🎯 Take Profit Level:
-TP1 : {round(tp1,2)} (70 pips)
-TP2 : {round(tp2,2)} (100 pips)
+🎯 TP1 : {round(tp1,2)} (70 pips)
+🎯 TP2 : {round(tp2,2)} (100 pips)
+⛔ SL  : {round(sl,2)} (40 pips)
 
-🛑 Stop Loss:
-SL : {round(sl,2)} (40 pips)
+📌 Outlook:
+{outlook}
 
-━━━━━━━━━━━━━━━━━━
-
-📌 Market Outlook:
-Market menunjukkan pergerakan dinamis dengan peluang intraday pada kedua arah. Sinyal diberikan berdasarkan probabilitas momentum jangka pendek.
-
-⚠️ Risk Management Rules:
-- Hindari entry saat harga tidak sesuai struktur market
-- Hindari candle agresif / spike tinggi
-- Hindari entry saat news HIGH IMPACT
-- Gunakan konfirmasi tambahan sebelum entry
+━━━━━━━━━━━━━━━
 """
 
-# ==========================
-# PRICE STREAM (tetap realtime)
-# ==========================
+# =========================
+# REALTIME PRICE
+# =========================
 async def price_stream():
 
     global last_price
@@ -122,7 +126,6 @@ async def price_stream():
                 logger.info("Connected Finnhub")
 
                 async for msg in ws:
-
                     data = json.loads(msg)
 
                     if data.get("type") == "trade":
@@ -134,9 +137,9 @@ async def price_stream():
             logger.warning(f"WS ERROR: {e}")
             await asyncio.sleep(5)
 
-# ==========================
-# SCHEDULER (WAJIB TIAP JAM 00)
-# ==========================
+# =========================
+# HOURLY SIGNAL (STRICT 00 MINUTE WIB)
+# =========================
 async def scheduler(app):
 
     while True:
@@ -144,65 +147,73 @@ async def scheduler(app):
         now = datetime.now(WIB)
 
         next_run = now.replace(minute=0, second=0, microsecond=0)
-
         if now.minute != 0:
             next_run += timedelta(hours=1)
 
-        wait = (next_run - now).total_seconds()
-        await asyncio.sleep(wait)
+        await asyncio.sleep((next_run - now).total_seconds())
 
-        msg = await generate_signal()
+        if is_trading_time():
 
-        if msg:
-            try:
-                await app.bot.send_message(chat_id=CHAT_ID, text=msg)
-                logger.info("Signal sent to group")
-            except Exception as e:
-                logger.error(f"Send error: {e}")
+            msg = await generate_signal()
 
-# ==========================
+            if msg:
+                try:
+                    await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+                    logger.info("Signal sent to group")
+                except Exception as e:
+                    logger.error(e)
+        else:
+            logger.info("Market closed")
+
+# =========================
 # COMMANDS
-# ==========================
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 RANDOM SIGNAL BOT AKTIF")
-
-async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_user.id != AUTHORIZED_USER_ID:
-        return await update.message.reply_text("No access")
-
-    msg = await generate_signal()
-    await update.message.reply_text(msg)
+    await update.message.reply_text("BOT AKTIF")
 
 async def harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with price_lock:
-        if last_price is None:
-            return await update.message.reply_text("No price yet")
+        if not last_price:
+            return await update.message.reply_text("No price")
         price = last_price
 
     await update.message.reply_text(f"XAUUSD: {price}")
 
-# ==========================
-# POST INIT
-# ==========================
-async def post_init(app):
-    asyncio.create_task(price_stream())
-    asyncio.create_task(scheduler(app))
-    logger.info("Bot running")
+async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-# ==========================
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return
+
+    msg = await generate_signal()
+
+    if msg:
+        await update.message.reply_text(msg)
+
+# =========================
+# POST INIT SAFE START
+# =========================
+async def post_init(app):
+    app.create_task(price_stream())
+    app.create_task(scheduler(app))
+    logger.info("Background tasks started")
+
+# =========================
 # MAIN
-# ==========================
+# =========================
 def main():
+
+    clear_webhook()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("signal", signal))
     app.add_handler(CommandHandler("harga", harga))
+    app.add_handler(CommandHandler("signal", signal))
 
     app.post_init = post_init
+
+    logger.info("BOT STARTED CLEAN MODE")
 
     app.run_polling()
 
