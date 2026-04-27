@@ -16,7 +16,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ==========================
-# ENV
+# LOAD ENV
 # ==========================
 load_dotenv()
 
@@ -47,12 +47,14 @@ logger = logging.getLogger("AI-BOT")
 # ==========================
 def is_trading_time():
     now = datetime.now(WIB)
+
     if now.weekday() >= 5:
         return False
+
     return 8 <= now.hour < 21
 
 # ==========================
-# INDICATORS (EMA + RSI)
+# INDICATORS
 # ==========================
 def calculate_indicators():
 
@@ -90,31 +92,29 @@ async def generate_signal():
 
     if not indicators:
         return f"""
-📊 AI MARKET UPDATE
+📊 MARKET UPDATE
 
-Time : {now}
-Price : {price}
+🕒 Time : {now}
+💰 Price : {price}
 
-Status : Waiting enough data for analysis
+Status : Waiting data for analysis
 """
 
     ema50, ema200, rsi = indicators
 
     signal = None
 
-    # STRATEGY LOGIC
     if ema50 > ema200 and rsi < 35:
         signal = "BUY"
     elif ema50 < ema200 and rsi > 65:
         signal = "SELL"
 
-    # NO TRADE
     if not signal:
         return f"""
 📊 MARKET UPDATE (NO TRADE)
 
-Time : {now}
-Price : {price}
+🕒 Time : {now}
+💰 Price : {price}
 
 EMA50 : {round(ema50,2)}
 EMA200 : {round(ema200,2)}
@@ -135,28 +135,37 @@ Status : No valid setup
         sl = price + 40 * pip
 
     return f"""
-🤖 AI TRADING SIGNAL
+🤖 AI TRADING SIGNAL (TECHNICAL ANALYSIS)
 
-Time : {now}
-Price : {price}
+🕒 Time : {now}
+💰 Price : {price}
 
-Trend:
+📊 Market Structure:
 EMA50 : {round(ema50,2)}
 EMA200 : {round(ema200,2)}
 RSI : {round(rsi,2)}
 
-Direction : {signal}
+📈 Direction : {signal}
 
+🎯 Take Profit Level:
 TP1 : {round(tp1,2)} (70 pips)
 TP2 : {round(tp2,2)} (100 pips)
-SL  : {round(sl,2)} (40 pips)
 
-━━━━━━━━━━━━━━
-⚠️ Risk Warning:
-- Hindari candle agresif
-- Hindari news high impact
-- Gunakan konfirmasi market structure
+🛑 Stop Loss:
+SL : {round(sl,2)} (40 pips)
+
+━━━━━━━━━━━━━━━━━━
+
+📌 Market Outlook:
+Analisa menunjukkan momentum mengikuti trend dominan berdasarkan kombinasi EMA crossover dan RSI confirmation. Entry hanya direkomendasikan pada kondisi retracement sehat dalam arah trend utama.
+
+⚠️ Risk Management Rules:
+- Hindari entry saat harga tidak sesuai struktur market
+- Hindari candle agresif / spike tinggi
+- Hindari entry saat news HIGH IMPACT
+- Tunggu konfirmasi tambahan (support/resistance rejection)
 """
+
 # ==========================
 # PRICE STREAM
 # ==========================
@@ -175,7 +184,7 @@ async def price_stream():
                     "symbol": PAIR
                 }))
 
-                logger.info("Connected WS")
+                logger.info("Connected Finnhub")
 
                 async for msg in ws:
 
@@ -196,7 +205,7 @@ async def price_stream():
             await asyncio.sleep(5)
 
 # ==========================
-# SCHEDULER (SETIAP 1 JAM WAJIB SEND)
+# SCHEDULER (SETIAP JAM 00 WIB)
 # ==========================
 async def scheduler(app):
 
@@ -205,6 +214,7 @@ async def scheduler(app):
         now = datetime.now(WIB)
 
         next_run = now.replace(minute=0, second=0, microsecond=0)
+
         if now.minute != 0:
             next_run += timedelta(hours=1)
 
@@ -223,7 +233,7 @@ async def scheduler(app):
 # COMMANDS
 # ==========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 AI BOT ACTIVE")
+    await update.message.reply_text("🤖 AI TRADING BOT AKTIF")
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -246,8 +256,8 @@ async def harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # POST INIT
 # ==========================
 async def post_init(app):
-    app.create_task(price_stream())
-    app.create_task(scheduler(app))
+    asyncio.create_task(price_stream())
+    asyncio.create_task(scheduler(app))
     logger.info("Bot running")
 
 # ==========================
