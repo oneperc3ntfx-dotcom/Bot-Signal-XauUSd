@@ -8,15 +8,13 @@ from datetime import datetime, timedelta
 
 import pytz
 import websockets
-import numpy as np
-import pandas as pd
 from dotenv import load_dotenv
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ==========================
-# LOAD ENV
+# ENV
 # ==========================
 load_dotenv()
 
@@ -35,15 +33,13 @@ PAIR = "OANDA:XAU_USD"
 WIB = pytz.timezone("Asia/Jakarta")
 
 last_price = None
-price_history = []
-MAX_HISTORY = 200
 price_lock = asyncio.Lock()
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("AI-BOT")
+logger = logging.getLogger("RANDOM-BOT")
 
 # ==========================
-# TRADING TIME
+# TRADING TIME (tetap jam kerja)
 # ==========================
 def is_trading_time():
     now = datetime.now(WIB)
@@ -54,74 +50,18 @@ def is_trading_time():
     return 8 <= now.hour < 21
 
 # ==========================
-# INDICATORS
-# ==========================
-def calculate_indicators():
-
-    if len(price_history) < 50:
-        return None
-
-    closes = pd.Series(price_history)
-
-    ema50 = closes.ewm(span=50).mean().iloc[-1]
-    ema200 = closes.ewm(span=200).mean().iloc[-1]
-
-    delta = closes.diff()
-
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-
-    rs = gain / (loss + 1e-9)
-    rsi = 100 - (100 / (1 + rs)).iloc[-1]
-
-    return ema50, ema200, rsi
-
-# ==========================
-# SIGNAL ENGINE
+# SIGNAL GENERATOR (RANDOM)
 # ==========================
 async def generate_signal():
 
     async with price_lock:
         if last_price is None:
-            return "No data"
+            return None
         price = last_price
 
     now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
 
-    indicators = calculate_indicators()
-
-    if not indicators:
-        return f"""
-📊 MARKET UPDATE
-
-🕒 Time : {now}
-💰 Price : {price}
-
-Status : Waiting data for analysis
-"""
-
-    ema50, ema200, rsi = indicators
-
-    signal = None
-
-    if ema50 > ema200 and rsi < 35:
-        signal = "BUY"
-    elif ema50 < ema200 and rsi > 65:
-        signal = "SELL"
-
-    if not signal:
-        return f"""
-📊 MARKET UPDATE (NO TRADE)
-
-🕒 Time : {now}
-💰 Price : {price}
-
-EMA50 : {round(ema50,2)}
-EMA200 : {round(ema200,2)}
-RSI : {round(rsi,2)}
-
-Status : No valid setup
-"""
+    signal = random.choice(["BUY", "SELL"])
 
     pip = 0.1
 
@@ -135,15 +75,10 @@ Status : No valid setup
         sl = price + 40 * pip
 
     return f"""
-🤖 AI TRADING SIGNAL (TECHNICAL ANALYSIS)
+🤖 AI RANDOM SIGNAL SYSTEM
 
 🕒 Time : {now}
 💰 Price : {price}
-
-📊 Market Structure:
-EMA50 : {round(ema50,2)}
-EMA200 : {round(ema200,2)}
-RSI : {round(rsi,2)}
 
 📈 Direction : {signal}
 
@@ -157,17 +92,17 @@ SL : {round(sl,2)} (40 pips)
 ━━━━━━━━━━━━━━━━━━
 
 📌 Market Outlook:
-Analisa menunjukkan momentum mengikuti trend dominan berdasarkan kombinasi EMA crossover dan RSI confirmation. Entry hanya direkomendasikan pada kondisi retracement sehat dalam arah trend utama.
+Market menunjukkan pergerakan dinamis dengan peluang intraday pada kedua arah. Sinyal diberikan berdasarkan probabilitas momentum jangka pendek.
 
 ⚠️ Risk Management Rules:
 - Hindari entry saat harga tidak sesuai struktur market
 - Hindari candle agresif / spike tinggi
 - Hindari entry saat news HIGH IMPACT
-- Tunggu konfirmasi tambahan (support/resistance rejection)
+- Gunakan konfirmasi tambahan sebelum entry
 """
 
 # ==========================
-# PRICE STREAM
+# PRICE STREAM (tetap realtime)
 # ==========================
 async def price_stream():
 
@@ -191,21 +126,16 @@ async def price_stream():
                     data = json.loads(msg)
 
                     if data.get("type") == "trade":
-
                         for t in data["data"]:
                             async with price_lock:
                                 last_price = float(t["p"])
-                                price_history.append(last_price)
-
-                                if len(price_history) > MAX_HISTORY:
-                                    price_history.pop(0)
 
         except Exception as e:
             logger.warning(f"WS ERROR: {e}")
             await asyncio.sleep(5)
 
 # ==========================
-# SCHEDULER (SETIAP JAM 00 WIB)
+# SCHEDULER (WAJIB TIAP JAM 00)
 # ==========================
 async def scheduler(app):
 
@@ -223,17 +153,18 @@ async def scheduler(app):
 
         msg = await generate_signal()
 
-        try:
-            await app.bot.send_message(chat_id=CHAT_ID, text=msg)
-            logger.info("Signal sent")
-        except Exception as e:
-            logger.error(f"Send error: {e}")
+        if msg:
+            try:
+                await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+                logger.info("Signal sent to group")
+            except Exception as e:
+                logger.error(f"Send error: {e}")
 
 # ==========================
 # COMMANDS
 # ==========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 AI TRADING BOT AKTIF")
+    await update.message.reply_text("🤖 RANDOM SIGNAL BOT AKTIF")
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
