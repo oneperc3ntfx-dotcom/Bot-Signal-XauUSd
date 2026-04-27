@@ -17,8 +17,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # ==========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
-FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
+AUTHORIZED_USER_ID = int(os.getenv("1305881282", "0"))
+FINNHUB_TOKEN = os.getenv("d3ndrd9r01qo7510lisgd3ndrd9r01qo7510lit0")
 
 PAIR_SYMBOL = "OANDA:XAU_USD"
 FLASK_PORT = int(os.getenv("PORT", "8080"))
