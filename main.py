@@ -8,13 +8,15 @@ from datetime import datetime, timedelta
 
 import pytz
 import websockets
+import numpy as np
+import pandas as pd
 from dotenv import load_dotenv
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ==========================
-# LOAD ENV
+# ENV
 # ==========================
 load_dotenv()
 
@@ -33,64 +35,130 @@ PAIR = "OANDA:XAU_USD"
 WIB = pytz.timezone("Asia/Jakarta")
 
 last_price = None
+price_history = []
+MAX_HISTORY = 200
 price_lock = asyncio.Lock()
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("BOT")
+logger = logging.getLogger("AI-BOT")
 
 # ==========================
-# TRADING TIME FILTER
+# TRADING TIME
 # ==========================
 def is_trading_time():
-
     now = datetime.now(WIB)
-    day = now.weekday()  # 0 = Senin
-
-    if day >= 5:  # Sabtu Minggu
+    if now.weekday() >= 5:
         return False
-
-    if 8 <= now.hour < 21:
-        return True
-
-    return False
+    return 8 <= now.hour < 21
 
 # ==========================
-# SIGNAL GENERATOR
+# INDICATORS (EMA + RSI)
+# ==========================
+def calculate_indicators():
+
+    if len(price_history) < 50:
+        return None
+
+    closes = pd.Series(price_history)
+
+    ema50 = closes.ewm(span=50).mean().iloc[-1]
+    ema200 = closes.ewm(span=200).mean().iloc[-1]
+
+    delta = closes.diff()
+
+    gain = delta.where(delta > 0, 0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+
+    rs = gain / (loss + 1e-9)
+    rsi = 100 - (100 / (1 + rs)).iloc[-1]
+
+    return ema50, ema200, rsi
+
+# ==========================
+# SIGNAL ENGINE
 # ==========================
 async def generate_signal():
 
     async with price_lock:
         if last_price is None:
-            return None
+            return "No data"
         price = last_price
-
-    direction = random.choice(["BUY", "SELL"])
-
-    if direction == "BUY":
-        tp = price + 10
-        sl = price - 5
-    else:
-        tp = price - 10
-        sl = price + 5
 
     now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
 
-    return f"""
-📊 XAUUSD SIGNAL
+    indicators = calculate_indicators()
 
-Time : {now} WIB
+    if not indicators:
+        return f"""
+📊 AI MARKET UPDATE
+
+Time : {now}
 Price : {price}
 
-Direction : {direction}
-
-TP : {round(tp,2)}
-SL : {round(sl,2)}
-
-⚠️ Risk management wajib
+Status : Waiting enough data for analysis
 """
 
+    ema50, ema200, rsi = indicators
+
+    signal = None
+
+    # STRATEGY LOGIC
+    if ema50 > ema200 and rsi < 35:
+        signal = "BUY"
+    elif ema50 < ema200 and rsi > 65:
+        signal = "SELL"
+
+    # NO TRADE
+    if not signal:
+        return f"""
+📊 MARKET UPDATE (NO TRADE)
+
+Time : {now}
+Price : {price}
+
+EMA50 : {round(ema50,2)}
+EMA200 : {round(ema200,2)}
+RSI : {round(rsi,2)}
+
+Status : No valid setup
+"""
+
+    pip = 0.1
+
+    if signal == "BUY":
+        tp1 = price + 70 * pip
+        tp2 = price + 100 * pip
+        sl = price - 40 * pip
+    else:
+        tp1 = price - 70 * pip
+        tp2 = price - 100 * pip
+        sl = price + 40 * pip
+
+    return f"""
+🤖 AI TRADING SIGNAL
+
+Time : {now}
+Price : {price}
+
+Trend:
+EMA50 : {round(ema50,2)}
+EMA200 : {round(ema200,2)}
+RSI : {round(rsi,2)}
+
+Direction : {signal}
+
+TP1 : {round(tp1,2)} (70 pips)
+TP2 : {round(tp2,2)} (100 pips)
+SL  : {round(sl,2)} (40 pips)
+
+━━━━━━━━━━━━━━
+⚠️ Risk Warning:
+- Hindari candle agresif
+- Hindari news high impact
+- Gunakan konfirmasi market structure
+"""
 # ==========================
-# REALTIME PRICE (FINNHUB)
+# PRICE STREAM
 # ==========================
 async def price_stream():
 
@@ -107,23 +175,28 @@ async def price_stream():
                     "symbol": PAIR
                 }))
 
-                logger.info("Connected Finnhub")
+                logger.info("Connected WS")
 
                 async for msg in ws:
 
                     data = json.loads(msg)
 
                     if data.get("type") == "trade":
+
                         for t in data["data"]:
                             async with price_lock:
                                 last_price = float(t["p"])
+                                price_history.append(last_price)
+
+                                if len(price_history) > MAX_HISTORY:
+                                    price_history.pop(0)
 
         except Exception as e:
             logger.warning(f"WS ERROR: {e}")
             await asyncio.sleep(5)
 
 # ==========================
-# AUTO SIGNAL (SETIAP JAM 00)
+# SCHEDULER (SETIAP 1 JAM WAJIB SEND)
 # ==========================
 async def scheduler(app):
 
@@ -132,73 +205,42 @@ async def scheduler(app):
         now = datetime.now(WIB)
 
         next_run = now.replace(minute=0, second=0, microsecond=0)
-
         if now.minute != 0:
             next_run += timedelta(hours=1)
 
         wait = (next_run - now).total_seconds()
-
         await asyncio.sleep(wait)
 
-        if is_trading_time():
+        msg = await generate_signal()
 
-            msg = await generate_signal()
-
-            if msg:
-                try:
-                    await app.bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=msg
-                    )
-                    logger.info("Signal sent to group")
-                except Exception as e:
-                    logger.error(f"Send error: {e}")
-
-        else:
-            logger.info("Market closed")
+        try:
+            await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+            logger.info("Signal sent")
+        except Exception as e:
+            logger.error(f"Send error: {e}")
 
 # ==========================
-# COMMAND: START
+# COMMANDS
 # ==========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 AI BOT ACTIVE")
 
-    await update.message.reply_text(
-        "🤖 BOT AKTIF\n\n"
-        "/signal - ambil signal\n"
-        "/harga - lihat harga"
-    )
+async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-# ==========================
-# COMMAND: HARGA
-# ==========================
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return await update.message.reply_text("No access")
+
+    msg = await generate_signal()
+    await update.message.reply_text(msg)
+
 async def harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with price_lock:
         if last_price is None:
-            return await update.message.reply_text("Harga belum tersedia")
+            return await update.message.reply_text("No price yet")
         price = last_price
 
     await update.message.reply_text(f"XAUUSD: {price}")
-
-# ==========================
-# COMMAND: SIGNAL (PRIVATE ONLY)
-# ==========================
-async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    # hanya private chat
-    if update.effective_chat.type != "private":
-        return
-
-    # hanya user tertentu
-    if update.effective_user.id != AUTHORIZED_USER_ID:
-        return await update.message.reply_text("Tidak diizinkan")
-
-    msg = await generate_signal()
-
-    if not msg:
-        return await update.message.reply_text("Harga belum tersedia")
-
-    await update.message.reply_text(msg)
 
 # ==========================
 # POST INIT
@@ -206,7 +248,7 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app):
     app.create_task(price_stream())
     app.create_task(scheduler(app))
-    logger.info("Background tasks running")
+    logger.info("Bot running")
 
 # ==========================
 # MAIN
@@ -216,12 +258,11 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("harga", harga))
     app.add_handler(CommandHandler("signal", signal))
+    app.add_handler(CommandHandler("harga", harga))
 
     app.post_init = post_init
 
-    logger.info("BOT STARTED")
     app.run_polling()
 
 if __name__ == "__main__":
