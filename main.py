@@ -16,7 +16,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # CONFIG
 # ==========================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("7678173969:AAFsD26EC2p4vyeTjxgGVSH3kMi_obIJ3k0")
 AUTHORIZED_USER_ID = int(os.getenv("1305881282", "0"))
 FINNHUB_TOKEN = os.getenv("d3ndrd9r01qo7510lisgd3ndrd9r01qo7510lit0")
 
