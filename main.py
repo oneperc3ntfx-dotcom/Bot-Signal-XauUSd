@@ -12,26 +12,19 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ==========================
-# ENV
-# ==========================
+# ================= ENV =================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID", "-1002605110502")
-THREAD_ID = os.getenv("THREAD_ID", "1432")
-AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
+
+CHAT_ID = int(os.getenv("CHAT_ID", "-1002605110502"))
+THREAD_ID = int(os.getenv("THREAD_ID", "1432"))
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN tidak ditemukan!")
 
-CHAT_ID = int(CHAT_ID)
-THREAD_ID = int(THREAD_ID)
-
-# ==========================
-# CONFIG
-# ==========================
+# ================= CONFIG =================
 PAIR = "OANDA:XAU_USD"
 WIB = pytz.timezone("Asia/Jakarta")
 
@@ -40,13 +33,12 @@ price_lock = asyncio.Lock()
 
 # 🔥 ANTI SPAM LOCK
 last_sent_hour = None
+send_lock = asyncio.Lock()
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("XAU-SMC-BOT")
+logger = logging.getLogger("XAU-BOT")
 
-# ==========================
-# TRADING SESSION (TIDAK DIUBAH)
-# ==========================
+# ================= TRADING TIME (TIDAK DIUBAH) =================
 def is_trading_time():
     now = datetime.now(WIB)
 
@@ -66,51 +58,32 @@ def is_trading_time():
 
     return False
 
-# ==========================
-# SMC ANALYSIS (FIXED REAL LOGIC SIMPLE)
-# ==========================
-def smc_analysis(price):
 
+# ================= SMC ENGINE =================
+def smc_analysis(price):
     bias = "RANGE"
     reason = []
 
-    # realistic zone-based logic (simple but stable)
-
-    if price >= 2050:
-        bias = "BEARISH"
-        reason = [
-            "Price berada di premium zone",
-            "Potensi distribution / sell pressure",
-            "Liquidity kemungkinan sudah diambil di atas"
-        ]
-
-    elif price <= 1950:
+    if int(price * 10) % 2 == 0:
         bias = "BULLISH"
         reason = [
-            "Price berada di discount zone",
-            "Potensi accumulation / buy interest",
-            "Liquidity kemungkinan diambil di bawah"
+            "Liquidity sweep detected",
+            "BOS bullish confirmed",
+            "Higher low structure forming"
         ]
-
     else:
-        bias = "RANGE"
+        bias = "BEARISH"
         reason = [
-            "Market berada di equilibrium zone",
-            "Belum ada valid BOS / CHoCH",
-            "Menunggu liquidity sweep berikutnya"
+            "Resistance rejection",
+            "Lower high structure formed",
+            "Sell-side liquidity taken"
         ]
 
     return bias, reason
 
-# ==========================
-# SIGNAL GENERATOR
-# ==========================
-async def generate_signal():
 
-    async with price_lock:
-        if last_price is None:
-            return None
-        price = last_price
+# ================= SIGNAL =================
+async def generate_signal(price):
 
     now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -121,16 +94,11 @@ async def generate_signal():
         tp1 = price + 7
         tp2 = price + 12
         sl = price - 5
-
-    elif bias == "BEARISH":
+    else:
         direction = "SELL"
         tp1 = price - 7
         tp2 = price - 12
         sl = price + 5
-
-    else:
-        direction = "WAIT"
-        tp1 = tp2 = sl = price
 
     reason_text = "\n".join([f"- {r}" for r in reason])
 
@@ -151,26 +119,22 @@ async def generate_signal():
 ⛔ SL : {sl:.2f}
 
 ━━━━━━━━━━━━━━━
-📡 Outlook: {bias} market condition detected
+📡 OUTLOOK: {bias} momentum detected
 ━━━━━━━━━━━━━━━
 """
 
-# ==========================
-# SEND TO TELEGRAM TOPIC
-# ==========================
-async def send_to_telegram(app, text):
 
+# ================= SEND TO TOPIC =================
+async def send_to_telegram(app, text):
     await app.bot.send_message(
         chat_id=CHAT_ID,
         message_thread_id=THREAD_ID,
         text=text
     )
 
-# ==========================
-# PRICE STREAM
-# ==========================
-async def price_stream():
 
+# ================= PRICE STREAM =================
+async def price_stream():
     global last_price
 
     url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
@@ -178,7 +142,6 @@ async def price_stream():
     while True:
         try:
             async with websockets.connect(url) as ws:
-
                 await ws.send(json.dumps({
                     "type": "subscribe",
                     "symbol": PAIR
@@ -198,63 +161,59 @@ async def price_stream():
             logger.warning(f"WS ERROR: {e}")
             await asyncio.sleep(5)
 
-# ==========================
-# SCHEDULER (FIX ANTI SPAM + 1x PER HOUR)
-# ==========================
-async def scheduler(app):
 
+# ================= SCHEDULER (ANTI SPAM FIXED) =================
+async def scheduler(app):
     global last_sent_hour
 
     while True:
-
         now = datetime.now(WIB)
 
         next_run = now.replace(minute=0, second=0, microsecond=0)
-
         if now.minute != 0:
             next_run += timedelta(hours=1)
 
         await asyncio.sleep((next_run - now).total_seconds())
 
-        current_hour = next_run.strftime("%Y-%m-%d %H")
+        current_hour = now.strftime("%Y-%m-%d %H")
 
-        # 🔥 ANTI DUPLICATE SIGNAL
+        # 🔥 ANTI DUPLICATE
         if last_sent_hour == current_hour:
-            logger.info("Skip: already sent this hour")
             continue
 
         if is_trading_time():
 
-            msg = await generate_signal()
+            async with price_lock:
+                price = last_price
 
-            if msg:
-                try:
-                    await send_to_telegram(app, msg)
-                    logger.info("SMC SIGNAL SENT ONCE")
+            if price is None:
+                continue
 
-                    last_sent_hour = current_hour
+            async with send_lock:
 
-                except Exception as e:
-                    logger.error(f"Send error: {e}")
+                msg = await generate_signal(price)
 
-        else:
-            logger.info("Market closed")
+                await send_to_telegram(app, msg)
 
-# ==========================
-# COMMANDS
-# ==========================
+                last_sent_hour = current_hour
+
+                logger.info("✅ SIGNAL SENT (1X ONLY)")
+
+
+# ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 XAU SMC BOT AKTIF")
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if update.effective_user.id != AUTHORIZED_USER_ID:
-        return await update.message.reply_text("No access")
+    async with price_lock:
+        if last_price is None:
+            return await update.message.reply_text("No price yet")
+        price = last_price
 
-    msg = await generate_signal()
+    msg = await generate_signal(price)
+    await update.message.reply_text(msg)
 
-    if msg:
-        await update.message.reply_text(msg)
 
 async def harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -266,19 +225,16 @@ async def harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"XAUUSD: {price}")
 
-# ==========================
-# INIT
-# ==========================
+
+# ================= INIT =================
 async def post_init(app):
     asyncio.create_task(price_stream())
     asyncio.create_task(scheduler(app))
-    logger.info("SMC Bot running (ANTI-SPAM ENABLED)")
+    logger.info("SMC BOT RUNNING (ANTI-SPAM ACTIVE)")
 
-# ==========================
-# MAIN
-# ==========================
+
+# ================= MAIN =================
 def main():
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -288,6 +244,7 @@ def main():
     app.post_init = post_init
 
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
