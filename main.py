@@ -20,11 +20,15 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+CHAT_ID = os.getenv("CHAT_ID", "-1002605110502")
+THREAD_ID = os.getenv("THREAD_ID", "1432")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN tidak ditemukan!")
+
+CHAT_ID = int(CHAT_ID)
+THREAD_ID = int(THREAD_ID)
 
 # ==========================
 # CONFIG
@@ -36,17 +40,15 @@ last_price = None
 price_lock = asyncio.Lock()
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("RANDOM-BOT")
+logger = logging.getLogger("XAU-BOT")
 
 # ==========================
 # TRADING TIME
 # ==========================
 def is_trading_time():
     now = datetime.now(WIB)
-
     if now.weekday() >= 5:
         return False
-
     return 8 <= now.hour < 21
 
 # ==========================
@@ -75,7 +77,7 @@ async def generate_signal():
         sl = price + 40 * pip
 
     return f"""
-📊 XAUUSD SIGNAL
+📊 XAUUSD SIGNAL (NEW TOPIC)
 
 🕒 Time : {now} WIB
 💰 Price : {price}
@@ -87,14 +89,24 @@ async def generate_signal():
 ⛔ SL  : {round(sl,2)}
 
 ━━━━━━━━━━━━━━━
-
-⚠️ Note:
-- Hindari entry saat harga tidak sesuai dengan pasar
-- Hindari entry saat candle agresif
-- Hindari saat news high impact
-
+⚠️ Test Signal XAU Baru
 ━━━━━━━━━━━━━━━
 """
+
+# ==========================
+# SEND TELEGRAM (TOPIC FIX)
+# ==========================
+async def send_to_telegram(app, text):
+
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text
+    }
+
+    # penting: kirim ke TOPIC
+    payload["message_thread_id"] = THREAD_ID
+
+    await app.bot.send_message(**payload)
 
 # ==========================
 # REALTIME PRICE
@@ -117,7 +129,6 @@ async def price_stream():
                 logger.info("Connected Finnhub")
 
                 async for msg in ws:
-
                     data = json.loads(msg)
 
                     if data.get("type") == "trade":
@@ -130,7 +141,7 @@ async def price_stream():
             await asyncio.sleep(5)
 
 # ==========================
-# SCHEDULER (SETIAP JAM 00 WIB)
+# SCHEDULER
 # ==========================
 async def scheduler(app):
 
@@ -139,7 +150,6 @@ async def scheduler(app):
         now = datetime.now(WIB)
 
         next_run = now.replace(minute=0, second=0, microsecond=0)
-
         if now.minute != 0:
             next_run += timedelta(hours=1)
 
@@ -151,10 +161,11 @@ async def scheduler(app):
 
             if msg:
                 try:
-                    await app.bot.send_message(chat_id=CHAT_ID, text=msg)
-                    logger.info("Signal sent to group")
+                    await send_to_telegram(app, msg)
+                    logger.info("Signal sent to TOPIC 1432")
                 except Exception as e:
                     logger.error(f"Send error: {e}")
+
         else:
             logger.info("Market closed")
 
@@ -162,7 +173,7 @@ async def scheduler(app):
 # COMMANDS
 # ==========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 RANDOM SIGNAL BOT AKTIF")
+    await update.message.reply_text("🤖 XAU BOT AKTIF")
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -189,7 +200,7 @@ async def harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app):
     asyncio.create_task(price_stream())
     asyncio.create_task(scheduler(app))
-    logger.info("Bot running")
+    logger.info("Bot running with TOPIC 1432")
 
 # ==========================
 # MAIN
