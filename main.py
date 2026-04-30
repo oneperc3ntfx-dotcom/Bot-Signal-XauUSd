@@ -43,16 +43,34 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("XAU-BOT")
 
 # ==========================
-# TRADING TIME
+# TRADING SESSION (FIXED RULE)
 # ==========================
 def is_trading_time():
     now = datetime.now(WIB)
+
+    # ❌ WEEKEND OFF
     if now.weekday() >= 5:
         return False
-    return 8 <= now.hour < 21
+
+    hour = now.hour
+
+    # ❌ BREAK 05:00 - 06:59
+    if 5 <= hour < 7:
+        return False
+
+    # ✔ ACTIVE 07:00 - 23:59
+    if hour >= 7:
+        return True
+
+    # ✔ ACTIVE 00:00 - 03:59
+    if hour < 4:
+        return True
+
+    # ❌ 04:00 - 05:59 (already covered but safe)
+    return False
 
 # ==========================
-# SIGNAL GENERATOR
+# SIGNAL
 # ==========================
 async def generate_signal():
 
@@ -64,7 +82,6 @@ async def generate_signal():
     now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
 
     direction = random.choice(["BUY", "SELL"])
-
     pip = 0.1
 
     if direction == "BUY":
@@ -77,39 +94,37 @@ async def generate_signal():
         sl = price + 40 * pip
 
     return f"""
-📊 XAUUSD SIGNAL (NEW TOPIC)
+📊 XAUUSD SIGNAL
 
-🕒 Time : {now} WIB
-💰 Price : {price}
+🕒 {now} WIB
+💰 Price: {price}
 
-📈 Direction : {direction}
+📈 Direction: {direction}
 
-🎯 TP1 : {round(tp1,2)}
-🎯 TP2 : {round(tp2,2)}
-⛔ SL  : {round(sl,2)}
+🎯 TP1: {round(tp1,2)}
+🎯 TP2: {round(tp2,2)}
+⛔ SL : {round(sl,2)}
 
 ━━━━━━━━━━━━━━━
-⚠️ Test Signal XAU Baru
+⚠️ AUTO SIGNAL XAU
 ━━━━━━━━━━━━━━━
 """
 
 # ==========================
-# SEND TELEGRAM (TOPIC FIX)
+# SEND TO TELEGRAM TOPIC
 # ==========================
 async def send_to_telegram(app, text):
 
     payload = {
         "chat_id": CHAT_ID,
-        "text": text
+        "text": text,
+        "message_thread_id": THREAD_ID
     }
-
-    # penting: kirim ke TOPIC
-    payload["message_thread_id"] = THREAD_ID
 
     await app.bot.send_message(**payload)
 
 # ==========================
-# REALTIME PRICE
+# PRICE STREAM
 # ==========================
 async def price_stream():
 
@@ -148,8 +163,8 @@ async def scheduler(app):
     while True:
 
         now = datetime.now(WIB)
-
         next_run = now.replace(minute=0, second=0, microsecond=0)
+
         if now.minute != 0:
             next_run += timedelta(hours=1)
 
@@ -162,7 +177,7 @@ async def scheduler(app):
             if msg:
                 try:
                     await send_to_telegram(app, msg)
-                    logger.info("Signal sent to TOPIC 1432")
+                    logger.info("Signal sent")
                 except Exception as e:
                     logger.error(f"Send error: {e}")
 
@@ -195,12 +210,12 @@ async def harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"XAUUSD: {price}")
 
 # ==========================
-# POST INIT
+# INIT
 # ==========================
 async def post_init(app):
     asyncio.create_task(price_stream())
     asyncio.create_task(scheduler(app))
-    logger.info("Bot running with TOPIC 1432")
+    logger.info("Bot running with NEW SESSION RULES")
 
 # ==========================
 # MAIN
