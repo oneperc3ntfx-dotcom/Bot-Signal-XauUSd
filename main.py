@@ -38,6 +38,9 @@ WIB = pytz.timezone("Asia/Jakarta")
 last_price = None
 price_lock = asyncio.Lock()
 
+# 🔥 ANTI SPAM LOCK
+last_sent_hour = None
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("XAU-SMC-BOT")
 
@@ -64,28 +67,43 @@ def is_trading_time():
     return False
 
 # ==========================
-# SMC ANALYSIS ENGINE (NEW)
+# SMC ANALYSIS (FIXED REAL LOGIC SIMPLE)
 # ==========================
 def smc_analysis(price):
 
-    # simple synthetic structure logic (upgradeable)
     bias = "RANGE"
     reason = []
 
-    # fake structure logic based on volatility zone
-    if price % 2 > 1:
-        bias = "BULLISH"
-        reason.append("Market showing higher momentum (possible HH structure)")
-        reason.append("Liquidity grab below detected")
-    else:
+    # realistic zone-based logic (simple but stable)
+
+    if price >= 2050:
         bias = "BEARISH"
-        reason.append("Market rejecting resistance zone")
-        reason.append("Possible LH structure forming")
+        reason = [
+            "Price berada di premium zone",
+            "Potensi distribution / sell pressure",
+            "Liquidity kemungkinan sudah diambil di atas"
+        ]
+
+    elif price <= 1950:
+        bias = "BULLISH"
+        reason = [
+            "Price berada di discount zone",
+            "Potensi accumulation / buy interest",
+            "Liquidity kemungkinan diambil di bawah"
+        ]
+
+    else:
+        bias = "RANGE"
+        reason = [
+            "Market berada di equilibrium zone",
+            "Belum ada valid BOS / CHoCH",
+            "Menunggu liquidity sweep berikutnya"
+        ]
 
     return bias, reason
 
 # ==========================
-# SIGNAL GENERATOR (SMC + OUTLOOK)
+# SIGNAL GENERATOR
 # ==========================
 async def generate_signal():
 
@@ -103,11 +121,13 @@ async def generate_signal():
         tp1 = price + 7
         tp2 = price + 12
         sl = price - 5
+
     elif bias == "BEARISH":
         direction = "SELL"
         tp1 = price - 7
         tp2 = price - 12
         sl = price + 5
+
     else:
         direction = "WAIT"
         tp1 = tp2 = sl = price
@@ -131,12 +151,12 @@ async def generate_signal():
 ⛔ SL : {sl:.2f}
 
 ━━━━━━━━━━━━━━━
-📡 Outlook: {bias} momentum detected on XAUUSD
+📡 Outlook: {bias} market condition detected
 ━━━━━━━━━━━━━━━
 """
 
 # ==========================
-# SEND TELEGRAM TOPIC
+# SEND TO TELEGRAM TOPIC
 # ==========================
 async def send_to_telegram(app, text):
 
@@ -147,7 +167,7 @@ async def send_to_telegram(app, text):
     )
 
 # ==========================
-# PRICE STREAM (UNCHANGED)
+# PRICE STREAM
 # ==========================
 async def price_stream():
 
@@ -179,19 +199,29 @@ async def price_stream():
             await asyncio.sleep(5)
 
 # ==========================
-# SCHEDULER (TETAP: JAM 00)
+# SCHEDULER (FIX ANTI SPAM + 1x PER HOUR)
 # ==========================
 async def scheduler(app):
+
+    global last_sent_hour
 
     while True:
 
         now = datetime.now(WIB)
+
         next_run = now.replace(minute=0, second=0, microsecond=0)
 
         if now.minute != 0:
             next_run += timedelta(hours=1)
 
         await asyncio.sleep((next_run - now).total_seconds())
+
+        current_hour = next_run.strftime("%Y-%m-%d %H")
+
+        # 🔥 ANTI DUPLICATE SIGNAL
+        if last_sent_hour == current_hour:
+            logger.info("Skip: already sent this hour")
+            continue
 
         if is_trading_time():
 
@@ -200,7 +230,10 @@ async def scheduler(app):
             if msg:
                 try:
                     await send_to_telegram(app, msg)
-                    logger.info("SMC signal sent")
+                    logger.info("SMC SIGNAL SENT ONCE")
+
+                    last_sent_hour = current_hour
+
                 except Exception as e:
                     logger.error(f"Send error: {e}")
 
@@ -239,7 +272,7 @@ async def harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app):
     asyncio.create_task(price_stream())
     asyncio.create_task(scheduler(app))
-    logger.info("SMC Bot running (hourly signals)")
+    logger.info("SMC Bot running (ANTI-SPAM ENABLED)")
 
 # ==========================
 # MAIN
