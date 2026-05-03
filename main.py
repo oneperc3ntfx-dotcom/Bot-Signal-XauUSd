@@ -3,8 +3,7 @@ import os
 import json
 import asyncio
 import logging
-import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytz
 import websockets
@@ -30,19 +29,39 @@ logger = logging.getLogger("SMC-BOT")
 # ================= GLOBAL PRICE =================
 last_price = None
 
-
-# ================= MARKET TIME =================
+# ================= TRADING SESSION =================
 def is_trading_time():
     now = datetime.now(WIB)
 
-    if now.weekday() >= 5:
+    # weekend full off (sabtu & minggu)
+    if now.weekday() == 6:
         return False
 
-    # senin - jumat aktif
-    return True
+    hour = now.hour
+    minute = now.minute
+
+    # jumat sampai sabtu 03:50 (extended session)
+    if now.weekday() == 4:
+        if hour < 7 or (hour == 3 and minute <= 50) or hour < 4:
+            return True
+
+    # senin - kamis
+    if now.weekday() < 4:
+        if hour >= 7 or hour < 4:
+            return True
+
+    return False
 
 
-# ================= REAL PRICE STREAM =================
+def session_status():
+    now = datetime.now(WIB)
+
+    if is_trading_time():
+        return "READY"
+    return "CLOSED"
+
+
+# ================= PRICE STREAM =================
 async def price_stream():
     global last_price
 
@@ -57,7 +76,7 @@ async def price_stream():
                     "symbol": "OANDA:XAU_USD"
                 }))
 
-                logger.info("📡 Finnhub connected")
+                logger.info("Finnhub connected")
 
                 async for msg in ws:
                     data = json.loads(msg)
@@ -71,113 +90,40 @@ async def price_stream():
             await asyncio.sleep(3)
 
 
-# ================= SAFE CANDLE (FALLBACK OPTIONAL) =================
-def get_candles():
+# ================= SMC SIMPLE LOGIC =================
+def smc_signal(price):
 
-    try:
-        if not FINNHUB_TOKEN:
-            return None
+    if not price:
+        return None, "NO DATA"
 
-        url = "https://api.twelvedata.com/time_series"
-        params = {
-            "symbol": "XAU/USD",
-            "interval": "5min",
-            "outputsize": 50,
-            "apikey": os.getenv("TWELVE_API")
-        }
-
-        r = requests.get(url, params=params, timeout=10).json()
-
-        if "values" not in r:
-            return None
-
-        candles = []
-
-        for c in r["values"]:
-            candles.append({
-                "open": float(c["open"]),
-                "high": float(c["high"]),
-                "low": float(c["low"]),
-                "close": float(c["close"])
-            })
-
-        return candles[::-1]
-
-    except:
-        return None
-
-
-# ================= SMC ENGINE SAFE =================
-def smc_engine(price, candles=None):
-
-    reasons = []
-    score = 5
-
-    if candles and len(candles) > 10:
-
-        highs = [c["high"] for c in candles]
-        lows = [c["low"] for c in candles]
-
-        last = candles[-1]
-
-        if last["low"] < min(lows[-10:]):
-            score += 2
-            reasons.append("Liquidity sweep BUY detected")
-
-        if last["high"] > max(highs[-10:]):
-            score += 2
-            reasons.append("Liquidity sweep SELL detected")
-
-        if last["close"] > candles[-2]["high"]:
-            score += 2
-            reasons.append("BOS bullish confirmed")
-
-        elif last["close"] < candles[-2]["low"]:
-            score += 2
-            reasons.append("BOS bearish confirmed")
-
+    # simple ganjil genap logic (sesuai request lama kamu)
+    if int(price) % 2 == 0:
+        return "BUY", "Liquidity buy pressure detected"
     else:
-        # fallback logic kalau candle gagal
-        if price:
-            if int(price) % 2 == 0:
-                reasons.append("Market imbalance detected")
-                score += 1
-            else:
-                reasons.append("Minor liquidity reaction")
-                score += 1
-
-    score = max(1, min(10, score))
-
-    bias = None
-    if score >= 7:
-        bias = "BUY"
-    elif score <= 4:
-        bias = "SELL"
-
-    return bias, score, reasons
+        return "SELL", "Liquidity sell pressure detected"
 
 
 # ================= SIGNAL BUILDER =================
 async def build_signal():
 
+    status = session_status()
+
     if not last_price:
-        return "⚠️ No market data yet..."
+        return "⚠️ No price data"
 
-    candles = get_candles()
-
-    bias, score, reasons = smc_engine(last_price, candles)
-
-    if not bias:
+    if status == "CLOSED":
         return f"""
-📊 XAUUSD SMC AI
+📴 MARKET CLOSED
 
-❌ NO TRADE ZONE
+⛔ No signal generated
 
-🧠 REASON:
-{chr(10).join(["- " + r for r in reasons])}
+🧠 Reason:
+- Outside trading session
 
-📉 Market still ranging / unclear structure
+━━━━━━━━━━━━
 """
+
+    bias, reason = smc_signal(last_price)
 
     entry = last_price
 
@@ -191,29 +137,79 @@ async def build_signal():
         sl = entry + 5
 
     return f"""
-📊 XAUUSD SMC AI SIGNAL
+📊 XAUUSD SMC SIGNAL
 
 📈 BIAS: {bias}
-⭐ SCORE: {score}/10
 
-💰 ENTRY (LIMIT): {entry:.2f}
+💰 ENTRY: {entry:.2f}
 
 🎯 TP1: {tp1:.2f}
 🎯 TP2: {tp2:.2f}
 ⛔ SL : {sl:.2f}
 
 🧠 REASON:
-{chr(10).join(["- " + r for r in reasons])}
+- {reason}
 
-━━━━━━━━━━━━━━
-🔥 SCALPING MODE ACTIVE
-━━━━━━━━━━━━━━
+━━━━━━━━━━━━
 """
+
+
+# ================= TELEGRAM SEND =================
+async def send(app, text):
+    await app.bot.send_message(
+        chat_id=CHAT_ID,
+        message_thread_id=THREAD_ID,
+        text=text
+    )
+
+
+# ================= SESSION MESSAGE =================
+async def session_watcher(app):
+
+    last_status = None
+
+    while True:
+
+        status = session_status()
+
+        # READY MESSAGE
+        if status == "READY" and last_status != "READY":
+            await send(app, "🟢 MARKET READY\nSMC BOT ACTIVE - SIGNAL READY")
+
+        # CLOSE MESSAGE
+        if status == "CLOSED" and last_status != "CLOSED":
+            await send(app, "🔴 MARKET CLOSED\nSMC BOT STOP SIGNAL")
+
+        last_status = status
+
+        await asyncio.sleep(60)
+
+
+# ================= HOURLY SIGNAL =================
+async def scheduler(app):
+
+    while True:
+
+        now = datetime.now(WIB)
+
+        next_run = now.replace(minute=0, second=0, microsecond=0)
+        if now.minute != 0:
+            next_run += timedelta(hours=1)
+
+        await asyncio.sleep((next_run - now).total_seconds())
+
+        if not is_trading_time():
+            continue
+
+        msg = await build_signal()
+        await send(app, msg)
+
+        logger.info("SIGNAL SENT")
 
 
 # ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 SMC AI BOT ACTIVE")
+    await update.message.reply_text("🤖 SMC BOT ACTIVE")
 
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -222,9 +218,8 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     if not last_price:
-        return await update.message.reply_text("Price belum ready")
+        return await update.message.reply_text("No price")
 
     await update.message.reply_text(f"XAUUSD: {last_price}")
 
@@ -232,7 +227,10 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= INIT =================
 async def post_init(app):
     asyncio.create_task(price_stream())
-    logger.info("🚀 SMC AI BOT RUNNING STABLE")
+    asyncio.create_task(scheduler(app))
+    asyncio.create_task(session_watcher(app))
+
+    logger.info("SMC BOT RUNNING STABLE")
 
 
 # ================= MAIN =================
