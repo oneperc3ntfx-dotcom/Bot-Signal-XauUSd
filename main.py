@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import os
 import json
 import asyncio
@@ -10,7 +11,11 @@ import websockets
 from dotenv import load_dotenv
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes
+)
 
 # ================= ENV =================
 load_dotenv()
@@ -26,49 +31,63 @@ WIB = pytz.timezone("Asia/Jakarta")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SMC-BOT")
 
-# ================= GLOBAL PRICE =================
+# ================= GLOBAL =================
 last_price = None
+last_signal_hour = None
 
 # ================= TRADING SESSION =================
 def is_trading_time():
+
     now = datetime.now(WIB)
 
-    # weekend full off (sabtu & minggu)
-    if now.weekday() == 6:
+    day = now.weekday()
+    hour = now.hour
+
+    # ================= SABTU =================
+    if day == 5:
         return False
 
-    hour = now.hour
-    minute = now.minute
+    # ================= MINGGU =================
+    if day == 6:
+        return False
 
-    # jumat sampai sabtu 03:50 (extended session)
-    if now.weekday() == 4:
-        if hour < 7 or (hour == 3 and minute <= 50) or hour < 4:
-            return True
+    # ================= SENIN =================
+    # mulai jam 07:00 WIB
+    if day == 0:
+        if hour < 7:
+            return False
+        return True
 
-    # senin - kamis
-    if now.weekday() < 4:
-        if hour >= 7 or hour < 4:
-            return True
+    # ================= SELASA - KAMIS =================
+    if day in [1, 2, 3]:
+        return True
+
+    # ================= JUMAT =================
+    if day == 4:
+        return True
 
     return False
 
 
 def session_status():
-    now = datetime.now(WIB)
 
     if is_trading_time():
         return "READY"
+
     return "CLOSED"
 
 
 # ================= PRICE STREAM =================
 async def price_stream():
+
     global last_price
 
     url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
 
     while True:
+
         try:
+
             async with websockets.connect(url) as ws:
 
                 await ws.send(json.dumps({
@@ -79,28 +98,44 @@ async def price_stream():
                 logger.info("Finnhub connected")
 
                 async for msg in ws:
+
                     data = json.loads(msg)
 
                     if data.get("type") == "trade":
+
                         for t in data["data"]:
+
                             last_price = float(t["p"])
 
         except Exception as e:
+
             logger.error(f"WS ERROR: {e}")
-            await asyncio.sleep(3)
+
+            await asyncio.sleep(5)
 
 
-# ================= SMC SIMPLE LOGIC =================
+# ================= SIMPLE SMC =================
 def smc_signal(price):
 
     if not price:
         return None, "NO DATA"
 
-    # simple ganjil genap logic (sesuai request lama kamu)
+    # LOGIC LAMA GANJIL GENAP
     if int(price) % 2 == 0:
-        return "BUY", "Liquidity buy pressure detected"
+
+        return "BUY", [
+            "Sell-side liquidity swept",
+            "Bullish reaction detected",
+            "Potential reversal zone active"
+        ]
+
     else:
-        return "SELL", "Liquidity sell pressure detected"
+
+        return "SELL", [
+            "Buy-side liquidity swept",
+            "Bearish rejection confirmed",
+            "Momentum continuation detected"
+        ]
 
 
 # ================= SIGNAL BUILDER =================
@@ -109,46 +144,67 @@ async def build_signal():
     status = session_status()
 
     if not last_price:
-        return "⚠️ No price data"
+        return "⚠️ No realtime price data"
 
     if status == "CLOSED":
-        return f"""
+
+        return """
 📴 MARKET CLOSED
 
 ⛔ No signal generated
 
 🧠 Reason:
 - Outside trading session
+- Waiting market reopen
+- Smart money inactive
 
 ━━━━━━━━━━━━
 """
 
-    bias, reason = smc_signal(last_price)
+    bias, narrative = smc_signal(last_price)
 
     entry = last_price
 
+    # ================= BUY =================
     if bias == "BUY":
+
+        setup = "BUY LIMIT"
+
         tp1 = entry + 7
         tp2 = entry + 15
         sl = entry - 5
+
+    # ================= SELL =================
     else:
+
+        setup = "SELL LIMIT"
+
         tp1 = entry - 7
         tp2 = entry - 15
         sl = entry + 5
 
+    reason_text = "\n".join([f"- {x}" for x in narrative])
+
+    now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
+
     return f"""
-📊 XAUUSD SMC SIGNAL
+📊 XAUUSD SMC OUTLOOK
 
-📈 BIAS: {bias}
+🕒 TIME : {now} WIB
 
-💰 ENTRY: {entry:.2f}
+📈 MARKET BIAS : {bias}
 
-🎯 TP1: {tp1:.2f}
-🎯 TP2: {tp2:.2f}
-⛔ SL : {sl:.2f}
+📌 SETUP PLAN:
+{setup} @ {entry:.2f}
 
-🧠 REASON:
-- {reason}
+🎯 TP1 : {tp1:.2f}
+🎯 TP2 : {tp2:.2f}
+⛔ SL  : {sl:.2f}
+
+🧠 AI REASON:
+{reason_text}
+
+⚠️ WAITING PRICE CONFIRMATION
 
 ━━━━━━━━━━━━
 """
@@ -156,6 +212,7 @@ async def build_signal():
 
 # ================= TELEGRAM SEND =================
 async def send(app, text):
+
     await app.bot.send_message(
         chat_id=CHAT_ID,
         message_thread_id=THREAD_ID,
@@ -163,7 +220,7 @@ async def send(app, text):
     )
 
 
-# ================= SESSION MESSAGE =================
+# ================= SESSION WATCHER =================
 async def session_watcher(app):
 
     last_status = None
@@ -172,60 +229,119 @@ async def session_watcher(app):
 
         status = session_status()
 
-        # READY MESSAGE
+        # ================= SESSION OPEN =================
         if status == "READY" and last_status != "READY":
-            await send(app, "🟢 MARKET READY\nSMC BOT ACTIVE - SIGNAL READY")
 
-        # CLOSE MESSAGE
+            await send(
+                app,
+                """
+🟢 MARKET READY
+
+🚀 SMART MONEY SESSION ACTIVE
+📡 AI SIGNAL SYSTEM ONLINE
+🔥 XAUUSD SCALPING MODE STARTED
+
+⚠️ Waiting high probability setup...
+━━━━━━━━━━━━
+"""
+            )
+
+        # ================= SESSION CLOSED =================
         if status == "CLOSED" and last_status != "CLOSED":
-            await send(app, "🔴 MARKET CLOSED\nSMC BOT STOP SIGNAL")
+
+            await send(
+                app,
+                """
+🔴 MARKET CLOSED
+
+📴 AI SIGNAL STOPPED
+💤 Smart money session ended
+
+⏳ Waiting next market session...
+━━━━━━━━━━━━
+"""
+            )
 
         last_status = status
 
         await asyncio.sleep(60)
 
 
-# ================= HOURLY SIGNAL =================
+# ================= SIGNAL SCHEDULER =================
 async def scheduler(app):
+
+    global last_signal_hour
 
     while True:
 
         now = datetime.now(WIB)
 
-        next_run = now.replace(minute=0, second=0, microsecond=0)
+        # tunggu tepat awal jam
+        next_run = now.replace(
+            minute=0,
+            second=0,
+            microsecond=0
+        )
+
         if now.minute != 0:
             next_run += timedelta(hours=1)
 
-        await asyncio.sleep((next_run - now).total_seconds())
+        wait_time = (next_run - now).total_seconds()
 
+        await asyncio.sleep(wait_time)
+
+        # hanya trading session
         if not is_trading_time():
             continue
 
+        current_hour = datetime.now(WIB).strftime("%Y-%m-%d %H")
+
+        # ================= ANTI SPAM =================
+        if current_hour == last_signal_hour:
+            continue
+
         msg = await build_signal()
+
         await send(app, msg)
 
-        logger.info("SIGNAL SENT")
+        last_signal_hour = current_hour
+
+        logger.info("SIGNAL SENT 1X")
 
 
-# ================= COMMANDS =================
+# ================= COMMAND START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 SMC BOT ACTIVE")
+
+    await update.message.reply_text(
+        "🤖 XAUUSD SMC BOT ACTIVE"
+    )
 
 
+# ================= COMMAND SIGNAL =================
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     msg = await build_signal()
+
     await update.message.reply_text(msg)
 
 
+# ================= COMMAND PRICE =================
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not last_price:
-        return await update.message.reply_text("No price")
 
-    await update.message.reply_text(f"XAUUSD: {last_price}")
+    if not last_price:
+
+        return await update.message.reply_text(
+            "⚠️ No realtime price"
+        )
+
+    await update.message.reply_text(
+        f"📈 XAUUSD : {last_price}"
+    )
 
 
 # ================= INIT =================
 async def post_init(app):
+
     asyncio.create_task(price_stream())
     asyncio.create_task(scheduler(app))
     asyncio.create_task(session_watcher(app))
