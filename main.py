@@ -1,245 +1,128 @@
-#!/usr/bin/env python3
-import os
-import json
 import asyncio
 import logging
-from datetime import datetime, timedelta
-
+from datetime import datetime
 import pytz
-import websockets
-from dotenv import load_dotenv
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ================= ENV =================
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
-
-CHAT_ID = int(os.getenv("CHAT_ID", "-1002605110502"))
-THREAD_ID = int(os.getenv("THREAD_ID", "1432"))
-
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN tidak ditemukan!")
-
-# ================= CONFIG =================
-PAIR = "OANDA:XAU_USD"
-WIB = pytz.timezone("Asia/Jakarta")
-
-last_price = None
-price_lock = asyncio.Lock()
-
-# 🔥 ANTI SPAM LOCK
-last_sent_hour = None
-send_lock = asyncio.Lock()
+from config import *
+from data_feed import stream_price, last_price
+from smc_engine import detect_smc, build_signal
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("XAU-BOT")
 
-# ================= TRADING TIME (TIDAK DIUBAH) =================
-def is_trading_time():
-    now = datetime.now(WIB)
+WIB = pytz.timezone("Asia/Jakarta")
 
-    if now.weekday() >= 5:
-        return False
-
-    hour = now.hour
-
-    if 5 <= hour < 7:
-        return False
-
-    if hour >= 7:
-        return True
-
-    if hour < 4:
-        return True
-
-    return False
+price_lock = asyncio.Lock()
+last_candles_cache = None
+last_signal_cache = None
 
 
-# ================= SMC ENGINE =================
-def smc_analysis(price):
-    bias = "RANGE"
-    reason = []
-
-    if int(price * 10) % 2 == 0:
-        bias = "BULLISH"
-        reason = [
-            "Liquidity sweep detected",
-            "BOS bullish confirmed",
-            "Higher low structure forming"
-        ]
-    else:
-        bias = "BEARISH"
-        reason = [
-            "Resistance rejection",
-            "Lower high structure formed",
-            "Sell-side liquidity taken"
-        ]
-
-    return bias, reason
+# ================= MARKET DATA (FAKE CANDLE BUILDER SIMPLE) =================
+def make_candles(price):
+    return [
+        {"high": price + 2, "low": price - 2, "close": price}
+        for _ in range(10)
+    ]
 
 
-# ================= SIGNAL =================
-async def generate_signal(price):
+# ================= AI ENGINE LOOP =================
+async def engine(app):
 
-    now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
-
-    bias, reason = smc_analysis(price)
-
-    if bias == "BULLISH":
-        direction = "BUY"
-        tp1 = price + 7
-        tp2 = price + 12
-        sl = price - 5
-    else:
-        direction = "SELL"
-        tp1 = price - 7
-        tp2 = price - 12
-        sl = price + 5
-
-    reason_text = "\n".join([f"- {r}" for r in reason])
-
-    return f"""
-📊 XAUUSD SMC SIGNAL
-
-🕒 Time: {now} WIB
-💰 Price: {price}
-
-📈 Bias: {bias}
-📌 Direction: {direction}
-
-🧠 Reason:
-{reason_text}
-
-🎯 TP1: {tp1:.2f}
-🎯 TP2: {tp2:.2f}
-⛔ SL : {sl:.2f}
-
-━━━━━━━━━━━━━━━
-📡 OUTLOOK: {bias} momentum detected
-━━━━━━━━━━━━━━━
-"""
-
-
-# ================= SEND TO TOPIC =================
-async def send_to_telegram(app, text):
-    await app.bot.send_message(
-        chat_id=CHAT_ID,
-        message_thread_id=THREAD_ID,
-        text=text
-    )
-
-
-# ================= PRICE STREAM =================
-async def price_stream():
-    global last_price
-
-    url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
+    global last_signal_cache, last_candles_cache
 
     while True:
-        try:
-            async with websockets.connect(url) as ws:
-                await ws.send(json.dumps({
-                    "type": "subscribe",
-                    "symbol": PAIR
-                }))
 
-                logger.info("Connected Finnhub")
+        async with price_lock:
+            price = last_price
 
-                async for msg in ws:
-                    data = json.loads(msg)
-
-                    if data.get("type") == "trade":
-                        for t in data["data"]:
-                            async with price_lock:
-                                last_price = float(t["p"])
-
-        except Exception as e:
-            logger.warning(f"WS ERROR: {e}")
-            await asyncio.sleep(5)
-
-
-# ================= SCHEDULER (ANTI SPAM FIXED) =================
-async def scheduler(app):
-    global last_sent_hour
-
-    while True:
-        now = datetime.now(WIB)
-
-        next_run = now.replace(minute=0, second=0, microsecond=0)
-        if now.minute != 0:
-            next_run += timedelta(hours=1)
-
-        await asyncio.sleep((next_run - now).total_seconds())
-
-        current_hour = now.strftime("%Y-%m-%d %H")
-
-        # 🔥 ANTI DUPLICATE
-        if last_sent_hour == current_hour:
+        if not price:
+            await asyncio.sleep(2)
             continue
 
-        if is_trading_time():
+        candles = make_candles(price)
+        last_candles_cache = candles
 
-            async with price_lock:
-                price = last_price
+        bias, reasons, score = detect_smc(candles)
 
-            if price is None:
-                continue
+        if score >= 7:
 
-            async with send_lock:
+            signal = build_signal(price, bias, score)
+            last_signal_cache = signal
 
-                msg = await generate_signal(price)
+            msg = f"""
+🔥 SMC AI SIGNAL READY
 
-                await send_to_telegram(app, msg)
+📊 Bias: {bias}
+💰 Entry: {signal['entry']:.2f}
 
-                last_sent_hour = current_hour
+🎯 TP1: {signal['tp1']:.2f}
+🎯 TP2: {signal['tp2']:.2f}
+⛔ SL : {signal['sl']:.2f}
 
-                logger.info("✅ SIGNAL SENT (1X ONLY)")
+🧠 Score: {score}/10
+
+Reason:
+- {"\n- ".join(reasons)}
+"""
+
+            await app.bot.send_message(CHAT_ID, msg, message_thread_id=THREAD_ID)
+
+        await asyncio.sleep(60)  # 1 menit scan (scalping mode)
 
 
 # ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 XAU SMC BOT AKTIF")
+    await update.message.reply_text("🤖 SMC AI BOT ACTIVE")
+
+
+async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return
+
+    if not last_price:
+        return await update.message.reply_text("No price")
+
+    await update.message.reply_text(f"💰 XAUUSD: {last_price}")
+
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    async with price_lock:
-        if last_price is None:
-            return await update.message.reply_text("No price yet")
-        price = last_price
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return
 
-    msg = await generate_signal(price)
-    await update.message.reply_text(msg)
+    if not last_signal_cache:
+        return await update.message.reply_text("No signal yet")
+
+    s = last_signal_cache
+
+    await update.message.reply_text(f"""
+🔥 LAST SIGNAL
+
+Type: {s['direction']}
+Entry: {s['entry']:.2f}
+TP1: {s['tp1']:.2f}
+TP2: {s['tp2']:.2f}
+SL: {s['sl']:.2f}
+Score: {s['score']}/10
+""")
 
 
-async def harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    async with price_lock:
-        if last_price is None:
-            return await update.message.reply_text("No price yet")
-
-        price = last_price
-
-    await update.message.reply_text(f"XAUUSD: {price}")
-
-
-# ================= INIT =================
+# ================= STARTUP =================
 async def post_init(app):
-    asyncio.create_task(price_stream())
-    asyncio.create_task(scheduler(app))
-    logger.info("SMC BOT RUNNING (ANTI-SPAM ACTIVE)")
+    asyncio.create_task(stream_price(price_lock))
+    asyncio.create_task(engine(app))
+    print("BOT RUNNING...")
 
 
-# ================= MAIN =================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("signal", signal))
-    app.add_handler(CommandHandler("harga", harga))
 
     app.post_init = post_init
 
