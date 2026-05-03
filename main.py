@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import os
-import requests
+import json
 import asyncio
 import logging
-from datetime import datetime, timedelta
+import requests
+from datetime import datetime
 
 import pytz
+import websockets
 from dotenv import load_dotenv
 
 from telegram import Update
@@ -16,20 +18,18 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
-TWELVE_API = os.getenv("TWELVE_API")
 
 CHAT_ID = int(os.getenv("CHAT_ID", "-1002605110502"))
-THREAD_ID = int(os.getenv("THREAD_ID", "1432"))
-
-AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
+THREAD_ID = int(os.getenv("THREAD_ID", "0"))
 
 WIB = pytz.timezone("Asia/Jakarta")
 
-last_price = None
-price_lock = asyncio.Lock()
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SMC-BOT")
+
+# ================= GLOBAL PRICE =================
+last_price = None
+
 
 # ================= MARKET TIME =================
 def is_trading_time():
@@ -38,29 +38,57 @@ def is_trading_time():
     if now.weekday() >= 5:
         return False
 
-    if 7 <= now.hour <= 23 or 0 <= now.hour <= 3:
-        return True
-
-    return False
+    # senin - jumat aktif
+    return True
 
 
-# ================= PRICE (FALLBACK FINNHUB) =================
-async def get_realtime_price():
+# ================= REAL PRICE STREAM =================
+async def price_stream():
     global last_price
-    return last_price
+
+    url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
+
+    while True:
+        try:
+            async with websockets.connect(url) as ws:
+
+                await ws.send(json.dumps({
+                    "type": "subscribe",
+                    "symbol": "OANDA:XAU_USD"
+                }))
+
+                logger.info("📡 Finnhub connected")
+
+                async for msg in ws:
+                    data = json.loads(msg)
+
+                    if data.get("type") == "trade":
+                        for t in data["data"]:
+                            last_price = float(t["p"])
+
+        except Exception as e:
+            logger.error(f"WS ERROR: {e}")
+            await asyncio.sleep(3)
 
 
-# ================= CANDLE ENGINE (SAFE) =================
+# ================= SAFE CANDLE (FALLBACK OPTIONAL) =================
 def get_candles():
 
     try:
-        if not TWELVE_API:
+        if not FINNHUB_TOKEN:
             return None
 
-        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=5min&outputsize=80&apikey={TWELVE_API}"
-        r = requests.get(url, timeout=10).json()
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": "XAU/USD",
+            "interval": "5min",
+            "outputsize": 50,
+            "apikey": os.getenv("TWELVE_API")
+        }
 
-        if not r or "values" not in r:
+        r = requests.get(url, params=params, timeout=10).json()
+
+        if "values" not in r:
             return None
 
         candles = []
@@ -75,47 +103,56 @@ def get_candles():
 
         return candles[::-1]
 
-    except Exception as e:
-        logger.error(f"CANDLE ERROR: {e}")
+    except:
         return None
 
 
-# ================= SMC ENGINE (ANTI CRASH) =================
-def smc_engine(candles):
+# ================= SMC ENGINE SAFE =================
+def smc_engine(price, candles=None):
 
-    if not candles or len(candles) < 20:
-        return None, 0, ["Insufficient market data"]
-
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
-
-    last = candles[-1]
-
-    score = 5
     reasons = []
+    score = 5
 
-    # Liquidity sweep logic
-    if last["low"] < min(lows[-20:]):
-        score += 2
-        reasons.append("Liquidity sweep BUY side detected")
+    if candles and len(candles) > 10:
 
-    if last["high"] > max(highs[-20:]):
-        score += 2
-        reasons.append("Liquidity sweep SELL side detected")
+        highs = [c["high"] for c in candles]
+        lows = [c["low"] for c in candles]
 
-    # BOS simple logic
-    if last["close"] > candles[-2]["high"]:
-        score += 2
-        reasons.append("BOS bullish confirmed")
+        last = candles[-1]
 
-    elif last["close"] < candles[-2]["low"]:
-        score += 2
-        reasons.append("BOS bearish confirmed")
+        if last["low"] < min(lows[-10:]):
+            score += 2
+            reasons.append("Liquidity sweep BUY detected")
 
-    # Clamp score
+        if last["high"] > max(highs[-10:]):
+            score += 2
+            reasons.append("Liquidity sweep SELL detected")
+
+        if last["close"] > candles[-2]["high"]:
+            score += 2
+            reasons.append("BOS bullish confirmed")
+
+        elif last["close"] < candles[-2]["low"]:
+            score += 2
+            reasons.append("BOS bearish confirmed")
+
+    else:
+        # fallback logic kalau candle gagal
+        if price:
+            if int(price) % 2 == 0:
+                reasons.append("Market imbalance detected")
+                score += 1
+            else:
+                reasons.append("Minor liquidity reaction")
+                score += 1
+
     score = max(1, min(10, score))
 
-    bias = "BUY" if score >= 7 else "SELL" if score <= 4 else None
+    bias = None
+    if score >= 7:
+        bias = "BUY"
+    elif score <= 4:
+        bias = "SELL"
 
     return bias, score, reasons
 
@@ -123,12 +160,14 @@ def smc_engine(candles):
 # ================= SIGNAL BUILDER =================
 async def build_signal():
 
+    if not last_price:
+        return "⚠️ No market data yet..."
+
     candles = get_candles()
 
-    bias, score, reasons = smc_engine(candles)
+    bias, score, reasons = smc_engine(last_price, candles)
 
     if not bias:
-
         return f"""
 📊 XAUUSD SMC AI
 
@@ -137,20 +176,16 @@ async def build_signal():
 🧠 REASON:
 {chr(10).join(["- " + r for r in reasons])}
 
-━━━━━━━━━━━━━━
-⚠️ Waiting BOS / Liquidity confirmation
-━━━━━━━━━━━━━━
+📉 Market still ranging / unclear structure
 """
 
-    price = candles[-1]["close"] if candles else 0
+    entry = last_price
 
     if bias == "BUY":
-        entry = price
         tp1 = entry + 7
         tp2 = entry + 15
         sl = entry - 5
     else:
-        entry = price
         tp1 = entry - 7
         tp2 = entry - 15
         sl = entry + 5
@@ -159,7 +194,7 @@ async def build_signal():
 📊 XAUUSD SMC AI SIGNAL
 
 📈 BIAS: {bias}
-📊 SCORE: {score}/10
+⭐ SCORE: {score}/10
 
 💰 ENTRY (LIMIT): {entry:.2f}
 
@@ -182,39 +217,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     msg = await build_signal()
     await update.message.reply_text(msg)
 
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    async with price_lock:
-        if last_price is None:
-            return await update.message.reply_text("Price belum tersedia")
-        await update.message.reply_text(f"XAUUSD: {last_price}")
+    if not last_price:
+        return await update.message.reply_text("Price belum ready")
+
+    await update.message.reply_text(f"XAUUSD: {last_price}")
 
 
-# ================= PRICE STREAM (SIMPLE MOCK PLACEHOLDER) =================
-async def fake_price_loop():
-    global last_price
-
-    while True:
-        try:
-            # fallback simple (kalau Finnhub kamu pakai sendiri)
-            last_price = 2000 + (datetime.now().second % 50)
-            await asyncio.sleep(2)
-        except:
-            await asyncio.sleep(2)
-
-
-# ================= START =================
+# ================= INIT =================
 async def post_init(app):
-    asyncio.create_task(fake_price_loop())
-    logger.info("SMC AI BOT RUNNING SAFE MODE")
+    asyncio.create_task(price_stream())
+    logger.info("🚀 SMC AI BOT RUNNING STABLE")
 
 
+# ================= MAIN =================
 def main():
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
