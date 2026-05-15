@@ -4,6 +4,7 @@ import os
 import json
 import asyncio
 import logging
+import requests
 from datetime import datetime, timedelta
 
 import pytz
@@ -44,38 +45,47 @@ def is_trading_time():
     day = now.weekday()
     hour = now.hour
 
-    # ================= SABTU (00:00 - 02:59 ON) =================
+    # Sabtu 00:00 - 02:59 ON
     if day == 5:
-        if hour < 3:
-            return True
-        return False
+        return hour < 3
 
-    # ================= MINGGU OFF =================
+    # Minggu OFF
     if day == 6:
         return False
 
-    # ================= SENIN (07:00 START) =================
+    # Senin start 07:00
     if day == 0:
-        if hour < 7:
-            return False
-        return True
+        return hour >= 7
 
-    # ================= SELASA - KAMIS =================
+    # Selasa - Kamis ON
     if day in [1, 2, 3]:
         return True
 
-    # ================= JUMAT =================
+    # Jumat ON (sampai Sabtu 03:00 handled di atas)
     if day == 4:
         return True
 
     return False
 
 
-def session_status():
-    return "READY" if is_trading_time() else "CLOSED"
+# ================= REST FALLBACK =================
+def get_rest_price():
+
+    try:
+        url = f"https://finnhub.io/api/v1/quote?symbol=OANDA:XAU_USD&token={FINNHUB_TOKEN}"
+        r = requests.get(url, timeout=5)
+        data = r.json()
+
+        if "c" in data:
+            return float(data["c"])
+
+    except Exception as e:
+        logger.error(f"REST ERROR: {e}")
+
+    return None
 
 
-# ================= PRICE STREAM =================
+# ================= PRICE STREAM (WS + AUTO FIX) =================
 async def price_stream():
 
     global last_price
@@ -84,16 +94,21 @@ async def price_stream():
 
     while True:
         try:
-            async with websockets.connect(url) as ws:
+            async with websockets.connect(
+                url,
+                ping_interval=20,
+                ping_timeout=20
+            ) as ws:
 
                 await ws.send(json.dumps({
                     "type": "subscribe",
                     "symbol": "OANDA:XAU_USD"
                 }))
 
-                logger.info("Finnhub connected")
+                logger.info("Finnhub WS connected")
 
                 async for msg in ws:
+
                     data = json.loads(msg)
 
                     if data.get("type") == "trade":
@@ -102,7 +117,20 @@ async def price_stream():
 
         except Exception as e:
             logger.error(f"WS ERROR: {e}")
-            await asyncio.sleep(5)
+            logger.info("Reconnecting WS in 3s...")
+            await asyncio.sleep(3)
+
+
+# ================= GET PRICE (HYBRID) =================
+def get_price():
+
+    global last_price
+
+    if last_price:
+        return last_price
+
+    # fallback REST kalau WS mati
+    return get_rest_price()
 
 
 # ================= SIMPLE SIGNAL =================
@@ -128,14 +156,16 @@ def smc_signal(price):
 # ================= BUILD SIGNAL =================
 async def build_signal():
 
-    if not last_price:
+    price = get_price()
+
+    if not price:
         return "⚠️ No realtime price data"
 
     if not is_trading_time():
         return "📴 MARKET CLOSED"
 
-    bias, reason = smc_signal(last_price)
-    entry = last_price
+    bias, reason = smc_signal(price)
+    entry = price
 
     if bias == "BUY":
         setup = "BUY LIMIT"
@@ -153,7 +183,7 @@ async def build_signal():
     now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
 
     return f"""
-📊 XAUUSD SMC SIGNAL
+📊 XAUUSD SIGNAL
 
 🕒 {now} WIB
 
@@ -174,6 +204,7 @@ async def build_signal():
 
 # ================= SEND =================
 async def send(app, text):
+
     await app.bot.send_message(
         chat_id=CHAT_ID,
         message_thread_id=THREAD_ID,
@@ -187,12 +218,13 @@ async def session_watcher(app):
     last_status = None
 
     while True:
-        status = session_status()
+
+        status = "READY" if is_trading_time() else "CLOSED"
 
         if status != last_status:
 
             if status == "READY":
-                await send(app, "🟢 MARKET OPEN\nSMC BOT ACTIVE")
+                await send(app, "🟢 MARKET OPEN\nBOT ACTIVE")
             else:
                 await send(app, "🔴 MARKET CLOSED")
 
@@ -209,11 +241,10 @@ async def scheduler(app):
 
         now = datetime.now(WIB)
 
-        # 🔥 ONLY MINUTE 15 EVERY HOUR
         next_run = now.replace(minute=15, second=0, microsecond=0)
 
         if now.minute >= 15:
-            next_run = next_run + timedelta(hours=1)
+            next_run += timedelta(hours=1)
 
         wait_time = (next_run - now).total_seconds()
         await asyncio.sleep(wait_time)
@@ -230,7 +261,8 @@ async def scheduler(app):
         await send(app, msg)
 
         last_signal_time = current_time
-        logger.info("SIGNAL SENT (UPDATED SCHEDULE)")
+
+        logger.info("SIGNAL SENT")
 
 
 # ================= COMMANDS =================
@@ -244,17 +276,22 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not last_price:
-        return await update.message.reply_text("⚠️ No price")
 
-    await update.message.reply_text(f"📈 XAUUSD: {last_price}")
+    price = get_price()
+
+    if not price:
+        return await update.message.reply_text("⚠️ No price data")
+
+    await update.message.reply_text(f"📈 XAUUSD: {price}")
 
 
 # ================= INIT =================
 async def post_init(app):
+
     asyncio.create_task(price_stream())
     asyncio.create_task(scheduler(app))
     asyncio.create_task(session_watcher(app))
+
     logger.info("BOT RUNNING STABLE")
 
 
