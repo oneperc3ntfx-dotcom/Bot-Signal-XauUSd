@@ -35,6 +35,7 @@ logger = logging.getLogger("SMC-BOT")
 # ================= GLOBAL =================
 last_price = None
 last_signal_time = None
+last_ws_update = None
 
 
 # ================= SESSION =================
@@ -61,7 +62,7 @@ def is_trading_time():
     if day in [1, 2, 3]:
         return True
 
-    # Jumat ON (sampai Sabtu 03:00 handled di atas)
+    # Jumat ON
     if day == 4:
         return True
 
@@ -73,10 +74,16 @@ def get_rest_price():
 
     try:
         url = f"https://finnhub.io/api/v1/quote?symbol=OANDA:XAU_USD&token={FINNHUB_TOKEN}"
+
         r = requests.get(url, timeout=5)
+
+        logger.info(f"REST STATUS: {r.status_code}")
+
         data = r.json()
 
-        if "c" in data:
+        logger.info(f"REST DATA: {data}")
+
+        if "c" in data and data["c"] != 0:
             return float(data["c"])
 
     except Exception as e:
@@ -88,12 +95,14 @@ def get_rest_price():
 # ================= PRICE STREAM (WS + AUTO FIX) =================
 async def price_stream():
 
-    global last_price
+    global last_price, last_ws_update
 
     url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
 
     while True:
+
         try:
+
             async with websockets.connect(
                 url,
                 ping_interval=20,
@@ -111,26 +120,69 @@ async def price_stream():
 
                     data = json.loads(msg)
 
+                    logger.info(f"WS RAW: {data}")
+
                     if data.get("type") == "trade":
+
                         for t in data["data"]:
+
                             last_price = float(t["p"])
+                            last_ws_update = datetime.now()
+
+                            logger.info(
+                                f"WS PRICE UPDATE: {last_price}"
+                            )
 
         except Exception as e:
+
             logger.error(f"WS ERROR: {e}")
             logger.info("Reconnecting WS in 3s...")
+
             await asyncio.sleep(3)
 
 
-# ================= GET PRICE (HYBRID) =================
+# ================= GET PRICE (HYBRID FIXED) =================
 def get_price():
 
-    global last_price
+    global last_price, last_ws_update
 
-    if last_price:
-        return last_price
+    try:
 
-    # fallback REST kalau WS mati
-    return get_rest_price()
+        # gunakan websocket jika fresh
+        if (
+            last_price and
+            last_ws_update and
+            (datetime.now() - last_ws_update).seconds < 30
+        ):
+
+            logger.info(
+                f"USING WS PRICE: {last_price}"
+            )
+
+            return last_price
+
+        logger.warning(
+            "WS STALE -> USING REST FALLBACK"
+        )
+
+        rest_price = get_rest_price()
+
+        if rest_price:
+
+            last_price = rest_price
+            last_ws_update = datetime.now()
+
+            logger.info(
+                f"USING REST PRICE: {rest_price}"
+            )
+
+            return rest_price
+
+    except Exception as e:
+
+        logger.error(f"GET PRICE ERROR: {e}")
+
+    return None
 
 
 # ================= SIMPLE SIGNAL =================
@@ -157,6 +209,8 @@ def smc_signal(price):
 async def build_signal():
 
     price = get_price()
+
+    logger.info(f"BUILD SIGNAL PRICE: {price}")
 
     if not price:
         return "⚠️ No realtime price data"
@@ -229,10 +283,11 @@ async def session_watcher(app):
                 await send(app, "🔴 MARKET CLOSED")
 
         last_status = status
+
         await asyncio.sleep(60)
 
 
-# ================= SCHEDULER (MINUTE 15) =================
+# ================= SCHEDULER =================
 async def scheduler(app):
 
     global last_signal_time
@@ -241,23 +296,35 @@ async def scheduler(app):
 
         now = datetime.now(WIB)
 
-        next_run = now.replace(minute=15, second=0, microsecond=0)
+        next_run = now.replace(
+            minute=15,
+            second=0,
+            microsecond=0
+        )
 
         if now.minute >= 15:
             next_run += timedelta(hours=1)
 
         wait_time = (next_run - now).total_seconds()
+
+        logger.info(
+            f"NEXT SIGNAL IN {wait_time:.0f} sec"
+        )
+
         await asyncio.sleep(wait_time)
 
         if not is_trading_time():
             continue
 
-        current_time = datetime.now(WIB).strftime("%Y-%m-%d %H:%M")
+        current_time = datetime.now(WIB).strftime(
+            "%Y-%m-%d %H:%M"
+        )
 
         if current_time == last_signal_time:
             continue
 
         msg = await build_signal()
+
         await send(app, msg)
 
         last_signal_time = current_time
@@ -267,11 +334,16 @@ async def scheduler(app):
 
 # ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 SMC BOT ACTIVE")
+
+    await update.message.reply_text(
+        "🤖 SMC BOT ACTIVE"
+    )
 
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     msg = await build_signal()
+
     await update.message.reply_text(msg)
 
 
@@ -280,9 +352,13 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price = get_price()
 
     if not price:
-        return await update.message.reply_text("⚠️ No price data")
+        return await update.message.reply_text(
+            "⚠️ No price data"
+        )
 
-    await update.message.reply_text(f"📈 XAUUSD: {price}")
+    await update.message.reply_text(
+        f"📈 XAUUSD: {price}"
+    )
 
 
 # ================= INIT =================
