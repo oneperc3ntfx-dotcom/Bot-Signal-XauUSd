@@ -464,7 +464,10 @@ def main():
 
     app.post_init = post_init
 
-    app.run_polling()
+    app.run_polling(
+        drop_pending_updates=True,
+        close_loop=False
+    )
 
 
 if __name__ == "__main__":
