@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 
 import os
-import json
 import asyncio
 import logging
 import requests
 from datetime import datetime, timedelta
 
 import pytz
-import websockets
 from dotenv import load_dotenv
 
 from telegram import Update
@@ -35,7 +33,6 @@ logger = logging.getLogger("SMC-BOT")
 # ================= GLOBAL =================
 last_price = None
 last_signal_time = None
-last_ws_update = None
 tasks_started = False
 
 
@@ -55,23 +52,21 @@ def is_trading_time():
     if day == 6:
         return False
 
-    # Senin start 07:00
+    # Senin mulai 07:00
     if day == 0:
         return hour >= 7
 
-    # Selasa - Kamis ON
-    if day in [1, 2, 3]:
-        return True
-
-    # Jumat ON
-    if day == 4:
+    # Selasa - Jumat ON
+    if day in [1, 2, 3, 4]:
         return True
 
     return False
 
 
-# ================= REST FALLBACK =================
-def get_rest_price():
+# ================= GET PRICE =================
+def get_price():
+
+    global last_price
 
     try:
 
@@ -81,7 +76,7 @@ def get_rest_price():
             f"&token={FINNHUB_TOKEN}"
         )
 
-        r = requests.get(url, timeout=5)
+        r = requests.get(url, timeout=10)
 
         logger.info(f"REST STATUS: {r.status_code}")
 
@@ -89,108 +84,34 @@ def get_rest_price():
 
         logger.info(f"REST DATA: {data}")
 
-        if "c" in data and data["c"] != 0:
-            return float(data["c"])
-
-    except Exception as e:
-
-        logger.error(f"REST ERROR: {e}")
-
-    return None
-
-
-# ================= PRICE STREAM =================
-async def price_stream():
-
-    global last_price, last_ws_update
-
-    url = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
-
-    while True:
-
-        try:
-
-            async with websockets.connect(
-                url,
-                ping_interval=20,
-                ping_timeout=20
-            ) as ws:
-
-                await ws.send(json.dumps({
-                    "type": "subscribe",
-                    "symbol": "OANDA:XAU_USD"
-                }))
-
-                logger.info("Finnhub WS connected")
-
-                async for msg in ws:
-
-                    data = json.loads(msg)
-
-                    logger.info(f"WS RAW: {data}")
-
-                    if data.get("type") == "trade":
-
-                        for t in data["data"]:
-
-                            last_price = float(t["p"])
-                            last_ws_update = datetime.now()
-
-                            logger.info(
-                                f"WS PRICE UPDATE: {last_price}"
-                            )
-
-        except Exception as e:
-
-            logger.error(f"WS ERROR: {e}")
-
-            logger.info(
-                "Reconnecting WS in 3s..."
-            )
-
-            await asyncio.sleep(3)
-
-
-# ================= GET PRICE =================
-def get_price():
-
-    global last_price, last_ws_update
-
-    try:
-
-        # gunakan websocket jika fresh
+        # valid response
         if (
-            last_price and
-            last_ws_update and
-            (datetime.now() - last_ws_update).seconds < 30
+            isinstance(data, dict)
+            and "c" in data
+            and data["c"]
+            and data["c"] != 0
         ):
 
+            last_price = float(data["c"])
+
             logger.info(
-                f"USING WS PRICE: {last_price}"
+                f"USING LIVE PRICE: {last_price}"
             )
 
             return last_price
 
-        logger.warning(
-            "WS STALE -> USING REST FALLBACK"
-        )
-
-        rest_price = get_rest_price()
-
-        if rest_price:
-
-            last_price = rest_price
-            last_ws_update = datetime.now()
-
-            logger.info(
-                f"USING REST PRICE: {rest_price}"
-            )
-
-            return rest_price
-
     except Exception as e:
 
         logger.error(f"GET PRICE ERROR: {e}")
+
+    # fallback cached price
+    if last_price is not None:
+
+        logger.warning(
+            f"USING CACHED PRICE: {last_price}"
+        )
+
+        return last_price
 
     return None
 
@@ -209,13 +130,11 @@ def smc_signal(price):
             "Momentum shift up"
         ]
 
-    else:
-
-        return "SELL", [
-            "Liquidity sweep bearish",
-            "Rejection detected",
-            "Momentum continuation"
-        ]
+    return "SELL", [
+        "Liquidity sweep bearish",
+        "Rejection detected",
+        "Momentum continuation"
+    ]
 
 
 # ================= BUILD SIGNAL =================
@@ -334,6 +253,7 @@ async def scheduler(app):
 
         now = datetime.now(WIB)
 
+        # target signal di menit 15 tiap jam
         next_run = now.replace(
             minute=15,
             second=0,
@@ -361,7 +281,7 @@ async def scheduler(app):
             microsecond=0
         )
 
-        # prevent duplicate signal
+        # anti duplicate
         if last_signal_time == current_time:
             continue
 
@@ -418,15 +338,11 @@ async def post_init(app):
 
     global tasks_started
 
-    # prevent duplicate tasks
+    # prevent duplicate task
     if tasks_started:
         return
 
     tasks_started = True
-
-    asyncio.create_task(
-        price_stream()
-    )
 
     asyncio.create_task(
         scheduler(app)
