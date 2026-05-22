@@ -316,18 +316,20 @@ async def scheduler(app):
         if not is_trading_time():
             continue
 
-        current_time = datetime.now(WIB).strftime(
-            "%Y-%m-%d %H:%M"
+        current_time = datetime.now(WIB).replace(
+            second=0,
+            microsecond=0
         )
 
-        if current_time == last_signal_time:
+        if last_signal_time == current_time:
             continue
+
+        # FIX DOUBLE SIGNAL
+        last_signal_time = current_time
 
         msg = await build_signal()
 
         await send(app, msg)
-
-        last_signal_time = current_time
 
         logger.info("SIGNAL SENT")
 
