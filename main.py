@@ -3,10 +3,11 @@
 import os
 import asyncio
 import logging
-import requests
 from datetime import datetime, timedelta
 
 import pytz
+import yfinance as yf
+
 from dotenv import load_dotenv
 
 from telegram import Update
@@ -20,14 +21,19 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
 
-CHAT_ID = int(os.getenv("CHAT_ID", "-1002605110502"))
-THREAD_ID = int(os.getenv("THREAD_ID", "0"))
+CHAT_ID = int(
+    os.getenv("CHAT_ID", "-1002605110502")
+)
+
+THREAD_ID = int(
+    os.getenv("THREAD_ID", "0")
+)
 
 WIB = pytz.timezone("Asia/Jakarta")
 
 logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger("SMC-BOT")
 
 # ================= GLOBAL =================
@@ -71,39 +77,35 @@ def get_price():
 
     try:
 
-        url = (
-            f"https://finnhub.io/api/v1/quote"
-            f"?symbol=OANDA:XAU_USD"
-            f"&token={FINNHUB_TOKEN}"
+        # Gold Futures
+        gold = yf.Ticker("GC=F")
+
+        data = gold.history(
+            period="1d",
+            interval="1m"
         )
 
-        r = requests.get(url, timeout=10)
+        if not data.empty:
 
-        logger.info(f"REST STATUS: {r.status_code}")
-
-        data = r.json()
-
-        logger.info(f"REST DATA: {data}")
-
-        # valid response
-        if (
-            isinstance(data, dict)
-            and "c" in data
-            and data["c"]
-            and data["c"] != 0
-        ):
-
-            last_price = float(data["c"])
+            last_price = float(
+                data["Close"].iloc[-1]
+            )
 
             logger.info(
-                f"USING LIVE PRICE: {last_price}"
+                f"YAHOO PRICE: {last_price}"
             )
 
             return last_price
 
+        logger.warning(
+            "Yahoo returned empty data"
+        )
+
     except Exception as e:
 
-        logger.error(f"GET PRICE ERROR: {e}")
+        logger.error(
+            f"GET PRICE ERROR: {e}"
+        )
 
     # fallback cached price
     if last_price is not None:
@@ -121,6 +123,7 @@ def get_price():
 def smc_signal(price):
 
     if not price:
+
         return None, ["NO DATA"]
 
     if int(price) % 2 == 0:
@@ -148,9 +151,11 @@ async def build_signal():
     )
 
     if not price:
+
         return "⚠️ No realtime price data"
 
     if not is_trading_time():
+
         return "📴 MARKET CLOSED"
 
     bias, reason = smc_signal(price)
@@ -262,6 +267,7 @@ async def scheduler(app):
         )
 
         if now.minute >= 15:
+
             next_run += timedelta(hours=1)
 
         wait_time = (
@@ -275,6 +281,7 @@ async def scheduler(app):
         await asyncio.sleep(wait_time)
 
         if not is_trading_time():
+
             continue
 
         current_time = datetime.now(WIB).replace(
@@ -284,6 +291,7 @@ async def scheduler(app):
 
         # anti duplicate signal
         if last_signal_time == current_time:
+
             continue
 
         last_signal_time = current_time
@@ -341,6 +349,7 @@ async def post_init(app):
 
     # prevent duplicate task
     if tasks_started:
+
         return
 
     tasks_started = True
