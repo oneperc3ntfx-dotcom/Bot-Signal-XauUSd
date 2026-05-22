@@ -36,6 +36,7 @@ logger = logging.getLogger("SMC-BOT")
 last_price = None
 last_signal_time = None
 last_ws_update = None
+tasks_started = False
 
 
 # ================= SESSION =================
@@ -73,7 +74,12 @@ def is_trading_time():
 def get_rest_price():
 
     try:
-        url = f"https://finnhub.io/api/v1/quote?symbol=OANDA:XAU_USD&token={FINNHUB_TOKEN}"
+
+        url = (
+            f"https://finnhub.io/api/v1/quote"
+            f"?symbol=OANDA:XAU_USD"
+            f"&token={FINNHUB_TOKEN}"
+        )
 
         r = requests.get(url, timeout=5)
 
@@ -87,12 +93,13 @@ def get_rest_price():
             return float(data["c"])
 
     except Exception as e:
+
         logger.error(f"REST ERROR: {e}")
 
     return None
 
 
-# ================= PRICE STREAM (WS + AUTO FIX) =================
+# ================= PRICE STREAM =================
 async def price_stream():
 
     global last_price, last_ws_update
@@ -136,12 +143,15 @@ async def price_stream():
         except Exception as e:
 
             logger.error(f"WS ERROR: {e}")
-            logger.info("Reconnecting WS in 3s...")
+
+            logger.info(
+                "Reconnecting WS in 3s..."
+            )
 
             await asyncio.sleep(3)
 
 
-# ================= GET PRICE (HYBRID FIXED) =================
+# ================= GET PRICE =================
 def get_price():
 
     global last_price, last_ws_update
@@ -192,12 +202,15 @@ def smc_signal(price):
         return None, ["NO DATA"]
 
     if int(price) % 2 == 0:
+
         return "BUY", [
             "Liquidity sweep bullish",
             "Reversal potential",
             "Momentum shift up"
         ]
+
     else:
+
         return "SELL", [
             "Liquidity sweep bearish",
             "Rejection detected",
@@ -210,7 +223,9 @@ async def build_signal():
 
     price = get_price()
 
-    logger.info(f"BUILD SIGNAL PRICE: {price}")
+    logger.info(
+        f"BUILD SIGNAL PRICE: {price}"
+    )
 
     if not price:
         return "⚠️ No realtime price data"
@@ -219,22 +234,32 @@ async def build_signal():
         return "📴 MARKET CLOSED"
 
     bias, reason = smc_signal(price)
+
     entry = price
 
     if bias == "BUY":
+
         setup = "BUY LIMIT"
+
         tp1 = entry + 7
         tp2 = entry + 15
         sl = entry - 5
+
     else:
+
         setup = "SELL LIMIT"
+
         tp1 = entry - 7
         tp2 = entry - 15
         sl = entry + 5
 
-    reason_text = "\n".join([f"- {r}" for r in reason])
+    reason_text = "\n".join([
+        f"- {r}" for r in reason
+    ])
 
-    now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(WIB).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
     return f"""
 📊 XAUUSD SIGNAL
@@ -273,14 +298,27 @@ async def session_watcher(app):
 
     while True:
 
-        status = "READY" if is_trading_time() else "CLOSED"
+        status = (
+            "READY"
+            if is_trading_time()
+            else "CLOSED"
+        )
 
         if status != last_status:
 
             if status == "READY":
-                await send(app, "🟢 MARKET OPEN\nBOT ACTIVE")
+
+                await send(
+                    app,
+                    "🟢 MARKET OPEN\nBOT ACTIVE"
+                )
+
             else:
-                await send(app, "🔴 MARKET CLOSED")
+
+                await send(
+                    app,
+                    "🔴 MARKET CLOSED"
+                )
 
         last_status = status
 
@@ -305,7 +343,9 @@ async def scheduler(app):
         if now.minute >= 15:
             next_run += timedelta(hours=1)
 
-        wait_time = (next_run - now).total_seconds()
+        wait_time = (
+            next_run - now
+        ).total_seconds()
 
         logger.info(
             f"NEXT SIGNAL IN {wait_time:.0f} sec"
@@ -321,10 +361,10 @@ async def scheduler(app):
             microsecond=0
         )
 
+        # prevent duplicate signal
         if last_signal_time == current_time:
             continue
 
-        # FIX DOUBLE SIGNAL
         last_signal_time = current_time
 
         msg = await build_signal()
@@ -335,25 +375,35 @@ async def scheduler(app):
 
 
 # ================= COMMANDS =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     await update.message.reply_text(
         "🤖 SMC BOT ACTIVE"
     )
 
 
-async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def signal(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     msg = await build_signal()
 
     await update.message.reply_text(msg)
 
 
-async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def price(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     price = get_price()
 
     if not price:
+
         return await update.message.reply_text(
             "⚠️ No price data"
         )
@@ -366,21 +416,51 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= INIT =================
 async def post_init(app):
 
-    asyncio.create_task(price_stream())
-    asyncio.create_task(scheduler(app))
-    asyncio.create_task(session_watcher(app))
+    global tasks_started
 
-    logger.info("BOT RUNNING STABLE")
+    # prevent duplicate tasks
+    if tasks_started:
+        return
+
+    tasks_started = True
+
+    asyncio.create_task(
+        price_stream()
+    )
+
+    asyncio.create_task(
+        scheduler(app)
+    )
+
+    asyncio.create_task(
+        session_watcher(app)
+    )
+
+    logger.info(
+        "BOT RUNNING STABLE"
+    )
 
 
 # ================= MAIN =================
 def main():
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("signal", signal))
-    app.add_handler(CommandHandler("price", price))
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        CommandHandler("signal", signal)
+    )
+
+    app.add_handler(
+        CommandHandler("price", price)
+    )
 
     app.post_init = post_init
 
