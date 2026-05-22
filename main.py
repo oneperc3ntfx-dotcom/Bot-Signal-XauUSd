@@ -33,6 +33,7 @@ logger = logging.getLogger("SMC-BOT")
 # ================= GLOBAL =================
 last_price = None
 last_signal_time = None
+last_market_status = None
 tasks_started = False
 
 
@@ -213,7 +214,7 @@ async def send(app, text):
 # ================= SESSION WATCH =================
 async def session_watcher(app):
 
-    last_status = None
+    global last_market_status
 
     while True:
 
@@ -223,7 +224,9 @@ async def session_watcher(app):
             else "CLOSED"
         )
 
-        if status != last_status:
+        if status != last_market_status:
+
+            last_market_status = status
 
             if status == "READY":
 
@@ -239,8 +242,6 @@ async def session_watcher(app):
                     "🔴 MARKET CLOSED"
                 )
 
-        last_status = status
-
         await asyncio.sleep(60)
 
 
@@ -253,7 +254,7 @@ async def scheduler(app):
 
         now = datetime.now(WIB)
 
-        # target signal di menit 15 tiap jam
+        # signal tiap jam menit 15
         next_run = now.replace(
             minute=15,
             second=0,
@@ -281,7 +282,7 @@ async def scheduler(app):
             microsecond=0
         )
 
-        # anti duplicate
+        # anti duplicate signal
         if last_signal_time == current_time:
             continue
 
@@ -353,12 +354,16 @@ async def post_init(app):
     )
 
     logger.info(
-        "BOT RUNNING STABLE"
+        f"BOT RUNNING STABLE | PID: {os.getpid()}"
     )
 
 
 # ================= MAIN =================
 def main():
+
+    logger.info(
+        f"BOT INSTANCE PID: {os.getpid()}"
+    )
 
     app = (
         ApplicationBuilder()
