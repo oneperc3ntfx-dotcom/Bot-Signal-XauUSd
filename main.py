@@ -3,11 +3,10 @@
 import os
 import asyncio
 import logging
+import requests
 from datetime import datetime, timedelta
 
 import pytz
-import yfinance as yf
-
 from dotenv import load_dotenv
 
 from telegram import Update
@@ -21,6 +20,7 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
 
 CHAT_ID = int(
     os.getenv("CHAT_ID", "-1002605110502")
@@ -75,39 +75,61 @@ def get_price():
 
     global last_price
 
-    try:
+    symbols = [
+        "OANDA:XAU_USD",
+        "FOREXCOM:XAUUSD",
+        "FXCM:XAU/USD"
+    ]
 
-        # Gold Futures
-        gold = yf.Ticker("GC=F")
+    for symbol in symbols:
 
-        data = gold.history(
-            period="1d",
-            interval="1m"
-        )
+        try:
 
-        if not data.empty:
+            url = (
+                "https://finnhub.io/api/v1/quote"
+                f"?symbol={symbol}"
+                f"&token={FINNHUB_TOKEN}"
+            )
 
-            last_price = float(
-                data["Close"].iloc[-1]
+            r = requests.get(
+                url,
+                timeout=10
             )
 
             logger.info(
-                f"YAHOO PRICE: {last_price}"
+                f"{symbol} STATUS: {r.status_code}"
             )
 
-            return last_price
+            data = r.json()
 
-        logger.warning(
-            "Yahoo returned empty data"
-        )
+            logger.info(
+                f"{symbol} DATA: {data}"
+            )
 
-    except Exception as e:
+            if (
+                isinstance(data, dict)
+                and "c" in data
+                and data["c"]
+                and data["c"] != 0
+            ):
 
-        logger.error(
-            f"GET PRICE ERROR: {e}"
-        )
+                last_price = float(
+                    data["c"]
+                )
 
-    # fallback cached price
+                logger.info(
+                    f"LIVE PRICE: {last_price}"
+                )
+
+                return last_price
+
+        except Exception as e:
+
+            logger.error(
+                f"{symbol} ERROR: {e}"
+            )
+
+    # fallback cached
     if last_price is not None:
 
         logger.warning(
@@ -259,7 +281,6 @@ async def scheduler(app):
 
         now = datetime.now(WIB)
 
-        # signal tiap jam menit 15
         next_run = now.replace(
             minute=15,
             second=0,
@@ -347,7 +368,6 @@ async def post_init(app):
 
     global tasks_started
 
-    # prevent duplicate task
     if tasks_started:
 
         return
