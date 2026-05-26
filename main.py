@@ -23,9 +23,9 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-FINNHUB_TOKEN = os.getenv(
-    "FINNHUB_TOKEN",
-    "d87sl89r01qmhakh7j0gd87sl89r01qmhakh7j10"
+GOLD_API_KEY = os.getenv(
+    "GOLD_API_KEY",
+    "ad7da25b-9f63-4586-a2cd-fb42cd521722"
 )
 
 CHAT_ID = int(
@@ -65,7 +65,7 @@ def is_trading_time():
     day = now.weekday()
     hour = now.hour
 
-    # Sabtu sampai jam 03:00
+    # Sabtu sampai jam 03:00 WIB
     if day == 5:
         return hour < 3
 
@@ -73,7 +73,7 @@ def is_trading_time():
     if day == 6:
         return False
 
-    # Senin mulai jam 07:00
+    # Senin mulai jam 07:00 WIB
     if day == 0:
         return hour >= 7
 
@@ -87,78 +87,67 @@ def get_price():
 
     global last_price
 
-    symbols = [
-        "OANDA:XAU_USD",
-        "FOREXCOM:XAUUSD",
-        "FXCM:XAU/USD"
-    ]
+    try:
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+        url = "https://www.goldapi.io/api/XAU/USD"
 
-    for symbol in symbols:
+        headers = {
+            "x-access-token": GOLD_API_KEY,
+            "Content-Type": "application/json"
+        }
 
-        try:
-
-            url = (
-                "https://finnhub.io/api/v1/quote"
-                f"?symbol={symbol}"
-                f"&token={FINNHUB_TOKEN}"
-            )
-
-            response = requests.get(
-                url,
-                headers=headers,
-                timeout=10
-            )
-
-            logger.info(
-                f"{symbol} STATUS: {response.status_code}"
-            )
-
-            data = response.json()
-
-            logger.info(
-                f"{symbol} DATA: {data}"
-            )
-
-            # validasi response
-            if (
-                isinstance(data, dict)
-                and data.get("c")
-                and float(data["c"]) > 0
-            ):
-
-                price = float(data["c"])
-
-                last_price = price
-
-                logger.info(
-                    f"LIVE PRICE: {price}"
-                )
-
-                return price
-
-        except Exception as e:
-
-            logger.error(
-                f"{symbol} ERROR: {e}"
-            )
-
-    # fallback cached price
-    if last_price is not None:
-
-        logger.warning(
-            f"USING CACHED PRICE: {last_price}"
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=10
         )
 
-        return last_price
+        logger.info(
+            f"GOLDAPI STATUS: {response.status_code}"
+        )
 
-    return None
+        data = response.json()
+
+        logger.info(
+            f"GOLDAPI DATA: {data}"
+        )
+
+        # validasi response
+        if response.status_code != 200:
+
+            logger.error(
+                f"GOLDAPI ERROR RESPONSE: {data}"
+            )
+
+            return last_price
+
+        # ambil harga
+        if (
+            isinstance(data, dict)
+            and "price" in data
+        ):
+
+            price = float(data["price"])
+
+            last_price = price
+
+            logger.info(
+                f"LIVE PRICE: {price}"
+            )
+
+            return price
+
+    except Exception as e:
+
+        logger.error(
+            f"GOLDAPI ERROR: {e}"
+        )
+
+    # fallback cache
+    return last_price
 
 
-# ================= SIGNAL ENGINE =================
+# ================= SIMPLE SIGNAL =================
 
 def smc_signal(price):
 
@@ -199,7 +188,7 @@ async def build_signal():
     if price is None:
 
         return "⚠️ No realtime price data"
-
+    
     bias, reasons = smc_signal(price)
 
     entry = price
@@ -294,7 +283,7 @@ async def session_watcher(app):
         await asyncio.sleep(60)
 
 
-# ================= SCHEDULER =================
+# ================= SIGNAL SCHEDULER =================
 
 async def scheduler(app):
 
@@ -304,7 +293,7 @@ async def scheduler(app):
 
         now = datetime.now(WIB)
 
-        # hanya menit 15 setiap jam
+        # signal hanya menit 15 setiap jam
         next_run = now.replace(
             minute=15,
             second=0,
