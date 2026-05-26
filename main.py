@@ -4,6 +4,7 @@ import os
 import asyncio
 import logging
 import requests
+
 from datetime import datetime, timedelta
 
 import pytz
@@ -16,11 +17,16 @@ from telegram.ext import (
     ContextTypes
 )
 
-# ================= ENV =================
+# ================= LOAD ENV =================
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
+
+FINNHUB_TOKEN = os.getenv(
+    "FINNHUB_TOKEN",
+    "d87sl89r01qmhakh7j0gd87sl89r01qmhakh7j10"
+)
 
 CHAT_ID = int(
     os.getenv("CHAT_ID", "-1002605110502")
@@ -30,20 +36,28 @@ THREAD_ID = int(
     os.getenv("THREAD_ID", "0")
 )
 
+# ================= TIMEZONE =================
+
 WIB = pytz.timezone("Asia/Jakarta")
 
-logging.basicConfig(level=logging.INFO)
+# ================= LOGGING =================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
 logger = logging.getLogger("SMC-BOT")
 
 # ================= GLOBAL =================
+
 last_price = None
 last_signal_time = None
 last_market_status = None
 tasks_started = False
 
+# ================= MARKET SESSION =================
 
-# ================= SESSION =================
 def is_trading_time():
 
     now = datetime.now(WIB)
@@ -51,7 +65,7 @@ def is_trading_time():
     day = now.weekday()
     hour = now.hour
 
-    # Sabtu 00:00 - 02:59 ON
+    # Sabtu sampai jam 03:00
     if day == 5:
         return hour < 3
 
@@ -59,18 +73,16 @@ def is_trading_time():
     if day == 6:
         return False
 
-    # Senin mulai 07:00
+    # Senin mulai jam 07:00
     if day == 0:
         return hour >= 7
 
     # Selasa - Jumat ON
-    if day in [1, 2, 3, 4]:
-        return True
-
-    return False
+    return True
 
 
 # ================= GET PRICE =================
+
 def get_price():
 
     global last_price
@@ -80,6 +92,10 @@ def get_price():
         "FOREXCOM:XAUUSD",
         "FXCM:XAU/USD"
     ]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
 
     for symbol in symbols:
 
@@ -91,37 +107,38 @@ def get_price():
                 f"&token={FINNHUB_TOKEN}"
             )
 
-            r = requests.get(
+            response = requests.get(
                 url,
+                headers=headers,
                 timeout=10
             )
 
             logger.info(
-                f"{symbol} STATUS: {r.status_code}"
+                f"{symbol} STATUS: {response.status_code}"
             )
 
-            data = r.json()
+            data = response.json()
 
             logger.info(
                 f"{symbol} DATA: {data}"
             )
 
+            # validasi response
             if (
                 isinstance(data, dict)
-                and "c" in data
-                and data["c"]
-                and data["c"] != 0
+                and data.get("c")
+                and float(data["c"]) > 0
             ):
 
-                last_price = float(
-                    data["c"]
-                )
+                price = float(data["c"])
+
+                last_price = price
 
                 logger.info(
-                    f"LIVE PRICE: {last_price}"
+                    f"LIVE PRICE: {price}"
                 )
 
-                return last_price
+                return price
 
         except Exception as e:
 
@@ -129,7 +146,7 @@ def get_price():
                 f"{symbol} ERROR: {e}"
             )
 
-    # fallback cached
+    # fallback cached price
     if last_price is not None:
 
         logger.warning(
@@ -141,30 +158,37 @@ def get_price():
     return None
 
 
-# ================= SIMPLE SIGNAL =================
+# ================= SIGNAL ENGINE =================
+
 def smc_signal(price):
 
-    if not price:
+    if price is None:
 
         return None, ["NO DATA"]
 
+    # contoh simple logic
     if int(price) % 2 == 0:
 
         return "BUY", [
             "Liquidity sweep bullish",
-            "Reversal potential",
+            "Bullish reversal",
             "Momentum shift up"
         ]
 
     return "SELL", [
         "Liquidity sweep bearish",
-        "Rejection detected",
+        "Bearish rejection",
         "Momentum continuation"
     ]
 
 
 # ================= BUILD SIGNAL =================
+
 async def build_signal():
+
+    if not is_trading_time():
+
+        return "📴 MARKET CLOSED"
 
     price = get_price()
 
@@ -172,15 +196,11 @@ async def build_signal():
         f"BUILD SIGNAL PRICE: {price}"
     )
 
-    if not price:
+    if price is None:
 
         return "⚠️ No realtime price data"
 
-    if not is_trading_time():
-
-        return "📴 MARKET CLOSED"
-
-    bias, reason = smc_signal(price)
+    bias, reasons = smc_signal(price)
 
     entry = price
 
@@ -201,7 +221,7 @@ async def build_signal():
         sl = entry + 5
 
     reason_text = "\n".join([
-        f"- {r}" for r in reason
+        f"- {r}" for r in reasons
     ])
 
     now = datetime.now(WIB).strftime(
@@ -228,7 +248,8 @@ async def build_signal():
 """
 
 
-# ================= SEND =================
+# ================= SEND MESSAGE =================
+
 async def send(app, text):
 
     await app.bot.send_message(
@@ -238,7 +259,8 @@ async def send(app, text):
     )
 
 
-# ================= SESSION WATCH =================
+# ================= SESSION WATCHER =================
+
 async def session_watcher(app):
 
     global last_market_status
@@ -246,7 +268,7 @@ async def session_watcher(app):
     while True:
 
         status = (
-            "READY"
+            "OPEN"
             if is_trading_time()
             else "CLOSED"
         )
@@ -255,7 +277,7 @@ async def session_watcher(app):
 
             last_market_status = status
 
-            if status == "READY":
+            if status == "OPEN":
 
                 await send(
                     app,
@@ -273,6 +295,7 @@ async def session_watcher(app):
 
 
 # ================= SCHEDULER =================
+
 async def scheduler(app):
 
     global last_signal_time
@@ -281,12 +304,14 @@ async def scheduler(app):
 
         now = datetime.now(WIB)
 
+        # hanya menit 15 setiap jam
         next_run = now.replace(
             minute=15,
             second=0,
             microsecond=0
         )
 
+        # jika sudah lewat menit 15
         if now.minute >= 15:
 
             next_run += timedelta(hours=1)
@@ -296,12 +321,20 @@ async def scheduler(app):
         ).total_seconds()
 
         logger.info(
-            f"NEXT SIGNAL IN {wait_time:.0f} sec"
+            f"NEXT SIGNAL: {next_run}"
+        )
+
+        logger.info(
+            f"WAITING {wait_time:.0f} SECONDS"
         )
 
         await asyncio.sleep(wait_time)
 
         if not is_trading_time():
+
+            logger.info(
+                "MARKET CLOSED"
+            )
 
             continue
 
@@ -310,7 +343,7 @@ async def scheduler(app):
             microsecond=0
         )
 
-        # anti duplicate signal
+        # anti duplicate
         if last_signal_time == current_time:
 
             continue
@@ -321,10 +354,13 @@ async def scheduler(app):
 
         await send(app, msg)
 
-        logger.info("SIGNAL SENT")
+        logger.info(
+            "SIGNAL SENT"
+        )
 
 
 # ================= COMMANDS =================
+
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -350,20 +386,21 @@ async def price(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    price = get_price()
+    p = get_price()
 
-    if not price:
+    if p is None:
 
         return await update.message.reply_text(
-            "⚠️ No price data"
+            "⚠️ No realtime price data"
         )
 
     await update.message.reply_text(
-        f"📈 XAUUSD: {price}"
+        f"📈 XAUUSD: {p:.2f}"
     )
 
 
 # ================= INIT =================
+
 async def post_init(app):
 
     global tasks_started
@@ -383,15 +420,16 @@ async def post_init(app):
     )
 
     logger.info(
-        f"BOT RUNNING STABLE | PID: {os.getpid()}"
+        "BOT RUNNING STABLE"
     )
 
 
 # ================= MAIN =================
+
 def main():
 
     logger.info(
-        f"BOT INSTANCE PID: {os.getpid()}"
+        "STARTING BOT..."
     )
 
     app = (
@@ -421,4 +459,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
