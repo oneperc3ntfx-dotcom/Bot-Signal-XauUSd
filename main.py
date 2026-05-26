@@ -10,7 +10,11 @@ from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
 
-from telegram import Update, BotCommand
+from telegram import (
+    Update,
+    BotCommand
+)
+
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -55,8 +59,6 @@ cached_price = None
 cached_price_time = None
 
 last_signal_time = None
-last_market_status = None
-
 tasks_started = False
 
 # ================= MARKET SESSION =================
@@ -169,7 +171,7 @@ def smc_signal(price):
 
         return None, ["NO DATA"]
 
-    # contoh logic sederhana
+    # logic sederhana
     if int(price) % 2 == 0:
 
         return "BUY", [
@@ -262,41 +264,6 @@ async def send(app, text):
     )
 
 
-# ================= SESSION WATCHER =================
-
-async def session_watcher(app):
-
-    global last_market_status
-
-    while True:
-
-        status = (
-            "OPEN"
-            if is_trading_time()
-            else "CLOSED"
-        )
-
-        if status != last_market_status:
-
-            last_market_status = status
-
-            if status == "OPEN":
-
-                await send(
-                    app,
-                    "🟢 MARKET OPEN\nBOT ACTIVE"
-                )
-
-            else:
-
-                await send(
-                    app,
-                    "🔴 MARKET CLOSED"
-                )
-
-        await asyncio.sleep(60)
-
-
 # ================= SCHEDULER =================
 
 async def scheduler(app):
@@ -307,14 +274,14 @@ async def scheduler(app):
 
         now = datetime.now(WIB)
 
-        # signal hanya setiap menit 15
+        # hanya menit 15 setiap jam
         next_run = now.replace(
             minute=15,
             second=0,
             microsecond=0
         )
 
-        # jika lewat menit 15
+        # jika sudah lewat menit 15
         if now.minute >= 15:
 
             next_run += timedelta(hours=1)
@@ -333,6 +300,7 @@ async def scheduler(app):
 
         await asyncio.sleep(wait_time)
 
+        # market tutup
         if not is_trading_time():
 
             logger.info(
@@ -414,19 +382,22 @@ async def post_init(app):
 
     tasks_started = True
 
-    # daftar command menu telegram
+    # menu command telegram
     await app.bot.set_my_commands([
         BotCommand("start", "Start bot"),
         BotCommand("price", "Check XAUUSD price"),
         BotCommand("signal", "Generate signal")
     ])
 
-    asyncio.create_task(
-        scheduler(app)
+    # notif sekali saat bot hidup
+    await send(
+        app,
+        "🤖 BOT ACTIVE"
     )
 
+    # jalankan scheduler
     asyncio.create_task(
-        session_watcher(app)
+        scheduler(app)
     )
 
     logger.info(
