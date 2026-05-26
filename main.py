@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -23,9 +23,9 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-GOLD_API_KEY = os.getenv(
-    "GOLD_API_KEY",
-    "ad7da25b-9f63-4586-a2cd-fb42cd521722"
+TWELVE_TOKEN = os.getenv(
+    "TWELVE_TOKEN",
+    "af23649e02da42aab3e78cf343513325"
 )
 
 CHAT_ID = int(
@@ -47,13 +47,16 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-logger = logging.getLogger("SMC-BOT")
+logger = logging.getLogger("XAU-BOT")
 
 # ================= GLOBAL =================
 
-last_price = None
+cached_price = None
+cached_price_time = None
+
 last_signal_time = None
 last_market_status = None
+
 tasks_started = False
 
 # ================= MARKET SESSION =================
@@ -85,51 +88,63 @@ def is_trading_time():
 
 def get_price():
 
-    global last_price
+    global cached_price
+    global cached_price_time
+
+    now = datetime.now(WIB)
+
+    # gunakan cache jika belum 15 menit
+    if (
+        cached_price is not None
+        and cached_price_time is not None
+    ):
+
+        diff = (
+            now - cached_price_time
+        ).total_seconds()
+
+        # cache 15 menit
+        if diff < 900:
+
+            logger.info(
+                f"USING CACHED PRICE: {cached_price}"
+            )
+
+            return cached_price
 
     try:
 
-        url = "https://www.goldapi.io/api/XAU/USD"
-
-        headers = {
-            "x-access-token": GOLD_API_KEY,
-            "Content-Type": "application/json"
-        }
+        url = (
+            "https://api.twelvedata.com/price"
+            "?symbol=XAU/USD"
+            f"&apikey={TWELVE_TOKEN}"
+        )
 
         response = requests.get(
             url,
-            headers=headers,
             timeout=10
         )
 
         logger.info(
-            f"GOLDAPI STATUS: {response.status_code}"
+            f"TWELVEDATA STATUS: {response.status_code}"
         )
 
         data = response.json()
 
         logger.info(
-            f"GOLDAPI DATA: {data}"
+            f"TWELVEDATA DATA: {data}"
         )
 
-        # validasi response
-        if response.status_code != 200:
-
-            logger.error(
-                f"GOLDAPI ERROR RESPONSE: {data}"
-            )
-
-            return last_price
-
-        # ambil harga
+        # validasi
         if (
-            isinstance(data, dict)
+            response.status_code == 200
             and "price" in data
         ):
 
             price = float(data["price"])
 
-            last_price = price
+            cached_price = price
+            cached_price_time = now
 
             logger.info(
                 f"LIVE PRICE: {price}"
@@ -140,14 +155,13 @@ def get_price():
     except Exception as e:
 
         logger.error(
-            f"GOLDAPI ERROR: {e}"
+            f"PRICE ERROR: {e}"
         )
 
-    # fallback cache
-    return last_price
+    return cached_price
 
 
-# ================= SIMPLE SIGNAL =================
+# ================= SIGNAL ENGINE =================
 
 def smc_signal(price):
 
@@ -155,7 +169,7 @@ def smc_signal(price):
 
         return None, ["NO DATA"]
 
-    # contoh simple logic
+    # contoh logic sederhana
     if int(price) % 2 == 0:
 
         return "BUY", [
@@ -188,7 +202,7 @@ async def build_signal():
     if price is None:
 
         return "⚠️ No realtime price data"
-    
+
     bias, reasons = smc_signal(price)
 
     entry = price
@@ -283,7 +297,7 @@ async def session_watcher(app):
         await asyncio.sleep(60)
 
 
-# ================= SIGNAL SCHEDULER =================
+# ================= SCHEDULER =================
 
 async def scheduler(app):
 
@@ -293,14 +307,14 @@ async def scheduler(app):
 
         now = datetime.now(WIB)
 
-        # signal hanya menit 15 setiap jam
+        # signal hanya setiap menit 15
         next_run = now.replace(
             minute=15,
             second=0,
             microsecond=0
         )
 
-        # jika sudah lewat menit 15
+        # jika lewat menit 15
         if now.minute >= 15:
 
             next_run += timedelta(hours=1)
@@ -356,7 +370,7 @@ async def start(
 ):
 
     await update.message.reply_text(
-        "🤖 SMC BOT ACTIVE"
+        "🤖 XAU BOT ACTIVE"
     )
 
 
@@ -388,7 +402,7 @@ async def price(
     )
 
 
-# ================= INIT =================
+# ================= POST INIT =================
 
 async def post_init(app):
 
@@ -399,6 +413,13 @@ async def post_init(app):
         return
 
     tasks_started = True
+
+    # daftar command menu telegram
+    await app.bot.set_my_commands([
+        BotCommand("start", "Start bot"),
+        BotCommand("price", "Check XAUUSD price"),
+        BotCommand("signal", "Generate signal")
+    ])
 
     asyncio.create_task(
         scheduler(app)
@@ -432,11 +453,11 @@ def main():
     )
 
     app.add_handler(
-        CommandHandler("signal", signal)
+        CommandHandler("price", price)
     )
 
     app.add_handler(
-        CommandHandler("price", price)
+        CommandHandler("signal", signal)
     )
 
     app.post_init = post_init
