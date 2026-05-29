@@ -225,10 +225,12 @@ async def scheduler(app):
 
         now = datetime.now(WIB)
 
-        next_run = now.replace(minute=15, second=0, microsecond=0)
+        # ================= UBAH KE MENIT 00 =================
+        next_run = now.replace(minute=0, second=0, microsecond=0)
 
-        if now.minute >= 15:
+        if now.minute >= 0:
             next_run += timedelta(hours=1)
+        # ===================================================
 
         wait_time = (next_run - now).total_seconds()
 
