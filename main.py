@@ -23,7 +23,12 @@ TWELVE_TOKEN = os.getenv(
     "TWELVE_TOKEN",
     "af23649e02da42aab3e78cf343513325"
 )
-
+CHAT_ID_BOT2 = int(
+    os.getenv(
+        "CHAT_ID_BOT2",
+        "-1004448252129"
+    )
+)
 CHAT_ID = int(os.getenv("CHAT_ID", "-1002605110502"))
 THREAD_ID = int(os.getenv("THREAD_ID", "0"))
 
