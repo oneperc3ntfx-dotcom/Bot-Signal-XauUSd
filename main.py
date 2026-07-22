@@ -11,14 +11,22 @@ import pytz
 from dotenv import load_dotenv
 
 from telegram import Update, BotCommand
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes
+)
 
 
 # ================= LOAD ENV =================
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+BOT_TOKEN = os.getenv(
+    "BOT_TOKEN"
+)
+
 
 TWELVE_TOKEN = os.getenv(
     "TWELVE_TOKEN",
@@ -26,20 +34,14 @@ TWELVE_TOKEN = os.getenv(
 )
 
 
+
 # ================= GROUP TARGET =================
+
 
 CHAT_ID_BOT2 = int(
     os.getenv(
         "CHAT_ID_BOT2",
         "-1004448252129"
-    )
-)
-
-
-THREAD_ID_BOT2 = int(
-    os.getenv(
-        "THREAD_ID_BOT2",
-        "0"
     )
 )
 
@@ -60,116 +62,206 @@ THREAD_ID = int(
 )
 
 
+
 # ================= TIMEZONE =================
 
-WIB = pytz.timezone("Asia/Jakarta")
+
+WIB = pytz.timezone(
+    "Asia/Jakarta"
+)
+
 
 
 # ================= LOGGING =================
 
+
 logging.basicConfig(
+
     level=logging.INFO,
+
     format="%(asctime)s | %(levelname)s | %(message)s"
+
 )
 
-logger = logging.getLogger("XAU-BOT")
+
+logger = logging.getLogger(
+    "XAU-BOT"
+)
+
 
 
 # ================= GLOBAL =================
 
+
 cached_price = None
+
 cached_price_time = None
 
+
 last_signal_time = None
+
+
 tasks_started = False
+
+
 
 
 # ================= MARKET SESSION =================
 
+
 def is_trading_time():
 
-    now = datetime.now(WIB)
+
+    now = datetime.now(
+        WIB
+    )
+
 
     day = now.weekday()
+
     hour = now.hour
 
 
+
+    # Sabtu sampai jam 03:00 WIB
+
     if day == 5:
+
         return hour < 3
 
 
+
+    # Minggu OFF
+
     if day == 6:
+
         return False
 
 
+
+    # Senin mulai jam 07:00 WIB
+
     if day == 0:
+
         return hour >= 7
+
 
 
     return True
 
 
 
+
+
 # ================= GET PRICE =================
+
 
 def get_price():
 
+
     global cached_price
+
     global cached_price_time
 
 
-    now = datetime.now(WIB)
+
+    now = datetime.now(
+        WIB
+    )
+
 
 
     if (
+
         cached_price is not None
-        and cached_price_time is not None
+
+        and
+
+        cached_price_time is not None
+
     ):
 
+
+
         diff = (
+
             now - cached_price_time
+
         ).total_seconds()
+
 
 
         if diff < 3:
 
+
             logger.info(
+
                 f"USING CACHE PRICE: {cached_price}"
+
             )
+
 
             return cached_price
 
 
 
+
+
     try:
 
+
         url = (
+
             "https://api.twelvedata.com/price"
+
             "?symbol=XAU/USD"
+
             f"&apikey={TWELVE_TOKEN}"
+
         )
+
 
 
         response = requests.get(
+
             url,
+
             timeout=10
+
         )
+
 
 
         logger.info(
+
             f"TWELVEDATA STATUS: {response.status_code}"
+
         )
+
 
 
         data = response.json()
 
 
-        if response.status_code == 200 and "price" in data:
+
+        if (
+
+            response.status_code == 200
+
+            and
+
+            "price" in data
+
+        ):
+
 
 
             price = float(
+
                 data["price"]
+
             )
+
 
 
             cached_price = price
@@ -177,12 +269,18 @@ def get_price():
             cached_price_time = now
 
 
+
             logger.info(
+
                 f"LIVE PRICE: {price}"
+
             )
 
 
+
             return price
+
+
 
 
 
@@ -190,14 +288,14 @@ def get_price():
 
 
         logger.error(
+
             f"PRICE ERROR: {e}"
+
         )
 
 
+
     return cached_price
-
-
-
 
 # ================= SIGNAL ENGINE =================
 
@@ -239,6 +337,7 @@ def smc_signal(price):
 
 
 
+
 # ================= BUILD SIGNAL =================
 
 async def build_signal():
@@ -253,24 +352,34 @@ async def build_signal():
     price = get_price()
 
 
+
     logger.info(
+
         f"BUILD SIGNAL PRICE: {price}"
+
     )
 
 
 
     if cached_price_time:
 
+
         age = (
+
             datetime.now(WIB)
+
             -
+
             cached_price_time
+
         ).total_seconds()
+
 
 
         if age > 10:
 
             price = get_price()
+
 
 
 
@@ -280,7 +389,13 @@ async def build_signal():
 
 
 
-    bias, reasons = smc_signal(price)
+
+
+    bias, reasons = smc_signal(
+
+        price
+
+    )
 
 
 
@@ -289,6 +404,7 @@ async def build_signal():
 
 
     if bias == "BUY":
+
 
         setup = "BUY LIMIT"
 
@@ -302,6 +418,7 @@ async def build_signal():
 
     else:
 
+
         setup = "SELL LIMIT"
 
         tp1 = entry - 7
@@ -313,82 +430,161 @@ async def build_signal():
 
 
 
+
     reason_text = "\n".join(
+
         [
+
             f"- {r}"
+
             for r in reasons
+
         ]
+
     )
 
 
-    now = datetime.now(WIB).strftime(
+
+    now = datetime.now(
+
+        WIB
+
+    ).strftime(
+
         "%Y-%m-%d %H:%M:%S"
+
     )
+
 
 
 
     return f"""
+
 📊 XAUUSD SIGNAL
+
 
 🕒 {now} WIB
 
+
 📈 BIAS: {bias}
+
 
 📌 ENTRY: {setup} @ {entry:.2f}
 
+
 🎯 TP1: {tp1:.2f}
+
 🎯 TP2: {tp2:.2f}
+
 ⛔ SL : {sl:.2f}
 
+
 🧠 REASON:
+
 {reason_text}
 
+
 ━━━━━━━━━━━━
+
 """
 
 
 
 
 
-# ================= SEND MESSAGE =================
+# ================= SEND TARGET =================
+
+async def send_target(
+
+    bot,
+
+    chat_id,
+
+    text,
+
+    thread_id=None
+
+):
+
+
+    if thread_id and thread_id != 0:
+
+
+        await bot.send_message(
+
+            chat_id=chat_id,
+
+            message_thread_id=thread_id,
+
+            text=text
+
+        )
+
+
+    else:
+
+
+        await bot.send_message(
+
+            chat_id=chat_id,
+
+            text=text
+
+        )
+
+
+
+
+
+# ================= AUTO SEND =================
 
 async def send(app, text):
 
 
-    # KIRIM KE GRUP LAMA
+    # Grup lama
 
-    await app.bot.send_message(
+    await send_target(
 
-        chat_id=CHAT_ID,
+        app.bot,
 
-        message_thread_id=THREAD_ID,
+        CHAT_ID,
 
-        text=text
+        text,
+
+        THREAD_ID
 
     )
+
 
 
     logger.info(
-        "SIGNAL SENT TO MAIN GROUP"
-    )
 
-
-
-    # KIRIM KE GRUP BOT 2
-
-    await app.bot.send_message(
-
-        chat_id=CHAT_ID_BOT2,
-
-        message_thread_id=THREAD_ID_BOT2,
-
-        text=text
+        "SIGNAL SENT MAIN GROUP"
 
     )
+
+
+
+    # Grup Bot 2
+
+    await send_target(
+
+        app.bot,
+
+        CHAT_ID_BOT2,
+
+        text,
+
+        0
+
+    )
+
 
 
     logger.info(
-        "SIGNAL SENT TO BOT2 GROUP"
+
+        "SIGNAL SENT BOT2 GROUP"
+
     )
 
 
@@ -399,72 +595,105 @@ async def send(app, text):
 
 async def scheduler(app):
 
+
     global last_signal_time
+
 
 
     while True:
 
 
-        now = datetime.now(WIB)
+        now = datetime.now(
+
+            WIB
+
+        )
+
 
 
         next_run = now.replace(
+
             minute=0,
+
             second=0,
+
             microsecond=0
+
         )
+
 
 
         if now.minute >= 0:
 
             next_run += timedelta(
+
                 hours=1
+
             )
 
 
+
+
         wait_time = (
+
             next_run - now
+
         ).total_seconds()
 
 
 
         logger.info(
+
             f"NEXT SIGNAL: {next_run}"
-        )
 
-
-        logger.info(
-            f"WAITING {wait_time:.0f} SECONDS"
         )
 
 
 
         await asyncio.sleep(
+
             wait_time
+
         )
+
 
 
 
         if not is_trading_time():
 
+
             logger.info(
+
                 "MARKET CLOSED"
+
             )
 
             continue
 
 
 
-        current_time = datetime.now(WIB).replace(
+
+
+        current_time = datetime.now(
+
+            WIB
+
+        ).replace(
+
             second=0,
+
             microsecond=0
+
         )
+
+
 
 
 
         if last_signal_time == current_time:
 
             continue
+
 
 
 
@@ -477,53 +706,135 @@ async def scheduler(app):
 
 
         await send(
+
             app,
+
             msg
+
         )
+
 
 
         logger.info(
+
             "SIGNAL SENT"
+
         )
 
 
 
 
 
-# ================= COMMANDS =================
+# ================= COMMAND =================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+
+    update: Update,
+
+    context: ContextTypes.DEFAULT_TYPE
+
+):
+
 
     await update.message.reply_text(
+
         "🤖 XAU BOT ACTIVE"
+
     )
 
 
 
-async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+
+async def signal(
+
+    update: Update,
+
+    context: ContextTypes.DEFAULT_TYPE
+
+):
+
 
     msg = await build_signal()
 
-    await update.message.reply_text(
-        msg
+
+
+    chat_id = update.effective_chat.id
+
+
+
+    thread_id = None
+
+
+
+
+    if chat_id == CHAT_ID:
+
+
+        thread_id = THREAD_ID
+
+
+
+    elif chat_id == CHAT_ID_BOT2:
+
+
+        thread_id = 0
+
+
+
+
+    await send_target(
+
+        context.bot,
+
+        chat_id,
+
+        msg,
+
+        thread_id
+
     )
 
 
 
-async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(
+
+        f"MANUAL SIGNAL SENT TO {chat_id}"
+
+    )
+
+
+
+
+
+async def price(
+
+    update: Update,
+
+    context: ContextTypes.DEFAULT_TYPE
+
+):
+
 
     p = get_price()
 
 
+
     if p is None:
 
+
         return await update.message.reply_text(
+
             "⚠️ No realtime price data"
+
         )
 
 
+
     await update.message.reply_text(
+
         f"📈 XAUUSD: {p:.2f}"
+
     )
 
 
@@ -538,6 +849,7 @@ async def post_init(app):
     global tasks_started
 
 
+
     if tasks_started:
 
         return
@@ -550,40 +862,61 @@ async def post_init(app):
 
     await app.bot.set_my_commands([
 
+
         BotCommand(
+
             "start",
+
             "Start bot"
+
         ),
 
+
         BotCommand(
+
             "price",
+
             "Check XAUUSD price"
+
         ),
 
+
         BotCommand(
+
             "signal",
+
             "Generate signal"
+
         )
+
 
     ])
 
 
 
+
     await send(
+
         app,
+
         "🤖 BOT ACTIVE"
+
     )
 
 
 
     asyncio.create_task(
+
         scheduler(app)
+
     )
 
 
 
     logger.info(
+
         "BOT RUNNING STABLE"
+
     )
 
 
@@ -596,38 +929,59 @@ def main():
 
 
     logger.info(
+
         "STARTING BOT..."
+
     )
 
 
 
     app = ApplicationBuilder().token(
+
         BOT_TOKEN
+
     ).build()
 
 
 
     app.add_handler(
+
         CommandHandler(
+
             "start",
+
             start
+
         )
+
     )
 
 
+
     app.add_handler(
+
         CommandHandler(
+
             "price",
+
             price
+
         )
+
     )
 
 
+
     app.add_handler(
+
         CommandHandler(
+
             "signal",
+
             signal
+
         )
+
     )
 
 
@@ -637,8 +991,11 @@ def main():
 
 
     app.run_polling(
+
         drop_pending_updates=True,
+
         close_loop=False
+
     )
 
 
